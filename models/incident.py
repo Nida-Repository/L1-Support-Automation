@@ -1,4 +1,4 @@
-#Represents an incident that your system creates after processing an alert.
+#Represents an incident that system creates after processing an alert.
 from datetime import datetime
 from typing import Optional
 
