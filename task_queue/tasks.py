@@ -53,9 +53,9 @@ def _send_to_dlq(raw_payload: dict, reason: str) -> None:
     name="process_prtg_webhook",
     max_retries=5,
     default_retry_delay=10,
-    retry_backoff=True,        # correct Celery option name (not "backoff")
-    retry_backoff_max=300,     # cap backoff at 5 minutes
-    retry_jitter=True,         # avoid thundering-herd retries
+    retry_backoff=True,        
+    retry_backoff_max=300,     
+    retry_jitter=True,         
 )
 def process_prtg_webhook_task(self, raw_payload: dict):
     """
@@ -64,9 +64,6 @@ def process_prtg_webhook_task(self, raw_payload: dict):
     """
     sensor_id = raw_payload.get("sensor_id", "Unknown")
 
-    # --- 1. Re-validate payload shape (defense in depth) ---
-    # A malformed payload is a PERMANENT failure — retrying it 5 times
-    # wastes the retry budget on something that will never succeed.
     try:
         payload = PRTGWebhookPayload.model_validate(raw_payload)
     except ValidationError as exc:

@@ -36,8 +36,8 @@ celery_app.conf.update(
                                               # silently vanish from the queue;
                                               # tasks.py explicitly routes to the
                                               # DLQ on final failure instead.
-    broker_connection_retry_on_startup=True, # required default changed in Celery 6-line behavior
-    broker_connection_max_retries=None,      # retry forever on startup
+    broker_connection_retry_on_startup=True, 
+    broker_connection_max_retries=None,      
 
     # --- Worker behavior ---
     worker_prefetch_multiplier=1,            # don't hoard messages ahead of DLQ-worthy retries

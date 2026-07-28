@@ -15,8 +15,6 @@ REDIS_URL = os.getenv("REDIS_URL")
 if not REDIS_URL:
     raise RuntimeError("REDIS_URL environment variable is not set")
 
-# Pooled client with sane timeouts — a hung Redis connection should never
-# be allowed to hang the webhook or the worker indefinitely.
 redis_pool = redis.ConnectionPool.from_url(
     REDIS_URL,
     decode_responses=True,
@@ -66,7 +64,7 @@ class CacheService:
 
 
 class IncidentStateTracker:
-    """Tracks active sensor states for dedup. On Redis failure we fail
+    """ On Redis failure we fail
     OPEN (treat as not-a-duplicate) so an outage never silently drops
     a real alert."""
 
