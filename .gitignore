@@ -8,3 +8,17 @@ venv/
 .venv/
 env/
 ENV/
+
+**/__pycache__/
+__pycache__/
+
+models/incident.py
+models/notification.py
+models/reports.py
+
+
+app/main.py
+app/tasks.py
+
+
+secure_redis
