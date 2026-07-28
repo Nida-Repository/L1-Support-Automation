@@ -4,12 +4,14 @@ from typing import Any, Optional
 import redis
 from dotenv import load_dotenv
 
+# Load environment variables from .env file
 load_dotenv()
+
 
 REDIS_URL = os.getenv("REDIS_URL")
 
-# Connect to Redis
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, protocol=2)
+# Initialize Redis client (Supports Redis 6/7/8 running in Docker)
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 
 class CacheService:
