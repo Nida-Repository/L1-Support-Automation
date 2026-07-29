@@ -4,7 +4,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# Target imports - replace 'app.services.ping_service' with your actual module path
 from services.ping_service import PingIp, process
 
 
