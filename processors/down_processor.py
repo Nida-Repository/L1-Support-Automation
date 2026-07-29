@@ -89,7 +89,7 @@ class DownWorkflow:
             ping_service = PingIp()
             ping_payload = {
                 "site_id": site_id,
-                "ip_address": primary_ip,
+                "target_ip": primary_ip,
                 "sensor_id": sensor_id,
             }
             ping_results = await ping_service.execute(ping_payload)
