@@ -1,5 +1,7 @@
 Install the requirements using:
 pip install fastapi uvicorn celery redis sqlalchemy "psycopg[binary]"
+pip install jinja2
+
 
 amqp              5.3.1
 annotated-doc     0.0.4
@@ -36,3 +38,4 @@ tzlocal           5.4.4
 uvicorn           0.51.0
 vine              5.1.0
 wcwidth           0.8.2
+Jinja2            3.1.6

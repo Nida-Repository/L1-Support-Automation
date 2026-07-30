@@ -4,6 +4,9 @@ import json
 import logging
 
 from app.crud import (
+    AlertHistoryRepository,
+    AlertStateRepository,
+    RepositoryError,
     SensorLogRepository,
     SensorRepository,
     SiteIspAssignmentRepository,
@@ -15,6 +18,10 @@ from app.models import LogLevelType, LogStatusType
 from services.ping_service import PingIp
 
 logger = logging.getLogger(__name__)
+
+# Name of the ALERT_STATES row that represents a sensor-down condition.
+# Adjust to match whatever value is actually seeded in your ALERT_STATES table.
+DOWN_STATE_NAME = "Down"
 
 
 def _serialize_payload_for_json(payload) -> dict:
@@ -51,6 +58,8 @@ class DownWorkflow:
             assignment_repo = SiteIspAssignmentRepository(session)
             site_repo = SiteRepository(session)
             log_repo = SensorLogRepository(session)
+            alert_state_repo = AlertStateRepository(session)
+            alert_repo = AlertHistoryRepository(session)
 
             sensor = sensor_repo.get(sensor_id)
             if not sensor:
@@ -85,35 +94,92 @@ class DownWorkflow:
                 primary_ip,
             )
 
+            # -----------------------------------------------------------
+            # Create alert_history row BEFORE running the ping diagnostic,
+            # so the resulting alert_id can be attached to the ping result
+            # and to the sensor_log entry below.
+            # -----------------------------------------------------------
+            alert_id = None
+            try:
+                down_state = alert_state_repo.get_by_name(DOWN_STATE_NAME)
+                if down_state is None:
+                    logger.error(
+                        "ALERT_STATES row '%s' not found; cannot create alert_history "
+                        "for sensor %s. Continuing without an alert_id.",
+                        DOWN_STATE_NAME,
+                        sensor_id,
+                    )
+                else:
+                    alert = alert_repo.create(
+                        sensor_id=sensor_id,
+                        state_id=down_state.state_id,
+                        alert_message="Sensor went DOWN",
+                        escalation_status="Pending",
+                    )
+                    alert_id = alert.alert_id
+                    logger.info(
+                        "Created alert_history %s for sensor %s", alert_id, sensor_id
+                    )
+            except RepositoryError:
+                # Don't let alert-creation failures block the down workflow --
+                # log it and continue without an alert_id.
+                logger.exception(
+                    "Failed to create alert_history for sensor %s", sensor_id
+                )
+            except Exception:
+                logger.exception(
+                    "Unexpected error creating alert_history for sensor %s", sensor_id
+                )
+
             # Execute ping service
             ping_service = PingIp()
             ping_payload = {
                 "site_id": site_id,
                 "target_ip": primary_ip,
                 "sensor_id": sensor_id,
+                "alert_id": alert_id,  # may be None if alert creation failed above
             }
-            ping_results = await ping_service.execute(ping_payload)
+
+            try:
+                ping_results = await ping_service.execute(ping_payload)
+            except Exception:
+                logger.exception(
+                    "Ping service execution failed for sensor %s (alert_id=%s)",
+                    sensor_id,
+                    alert_id,
+                )
+                ping_results = None
 
             # Safely convert payload into JSON-serializable primitive dict
             raw_payload_data = _serialize_payload_for_json(payload)
 
             # Create sensor_log entry (will now commit successfully)
-            log_repo.create(
-                sensor_id=sensor_id,
-                log_timestamp=datetime.datetime.now(datetime.timezone.utc),
-                log_level=LogLevelType.CRITICAL,
-                log_status=LogStatusType.OPENED,
-                log_message=f"Sensor registered DOWN. Executed ping diagnostic against {primary_ip}.",
-                log_details={
-                    "site_id": site_id,
-                    "target_ip": primary_ip,
-                    "ping_results": ping_results,
-                    "raw_payload": raw_payload_data,
-                },
-            )
+            try:
+                log_repo.create(
+                    sensor_id=sensor_id,
+                    log_timestamp=datetime.datetime.now(datetime.timezone.utc),
+                    log_level=LogLevelType.CRITICAL,
+                    log_status=LogStatusType.OPENED,
+                    log_message=f"Sensor registered DOWN. Executed ping diagnostic against {primary_ip}.",
+                    log_details={
+                        "site_id": site_id,
+                        "target_ip": primary_ip,
+                        "alert_id": alert_id,
+                        "ping_results": ping_results,
+                        "raw_payload": raw_payload_data,
+                    },
+                )
+            except RepositoryError:
+                logger.exception(
+                    "Failed to create sensor_log for sensor %s (alert_id=%s)",
+                    sensor_id,
+                    alert_id,
+                )
 
         logger.info(
-            "Down workflow completed successfully for sensor %s", sensor_id
+            "Down workflow completed successfully for sensor %s (alert_id=%s)",
+            sensor_id,
+            alert_id,
         )
 
 
