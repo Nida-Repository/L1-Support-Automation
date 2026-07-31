@@ -22,3 +22,5 @@ app/tasks.py
 
 
 secure_redis
+
+logs

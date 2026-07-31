@@ -4,6 +4,7 @@ import json
 import logging
 
 from app.crud import (
+    RepositoryError,
     SensorLogRepository,
     SensorRepository,
     session_scope,
@@ -28,6 +29,8 @@ def _serialize_payload_for_json(payload) -> dict:
 class UpWorkflow:
 
     async def execute(self, payload):
+        logger.info("Executing UpWorkflow...")
+
         # Extract sensor_id safely
         if hasattr(payload, "sensor_id"):
             sensor_id = payload.sensor_id
@@ -39,6 +42,8 @@ class UpWorkflow:
         if not sensor_id:
             logger.error("Payload missing 'sensor_id': %s", payload)
             return
+
+        logger.info("Processing UpWorkflow for sensor_id: %s", sensor_id)
 
         with session_scope(SessionLocal) as session:
             sensor_repo = SensorRepository(session)
@@ -54,16 +59,26 @@ class UpWorkflow:
 
             # Option B: Create a resolution log entry marking the state as CLOSED
             raw_payload_data = _serialize_payload_for_json(payload)
-            log_repo.create(
-                sensor_id=sensor_id,
-                log_timestamp=datetime.datetime.now(datetime.timezone.utc),
-                log_level=LogLevelType.INFO,
-                log_status=LogStatusType.CLOSED,
-                log_message="Sensor recovered and registered UP. Issue marked as CLOSED.",
-                log_details={
-                    "raw_payload": raw_payload_data,
-                },
-            )
+            try:
+                log_entry = log_repo.create(
+                    sensor_id=sensor_id,
+                    log_timestamp=datetime.datetime.now(datetime.timezone.utc),
+                    log_level=LogLevelType.INFO,
+                    log_status=LogStatusType.CLOSED,
+                    log_message="Sensor recovered and registered UP. Issue marked as CLOSED.",
+                    log_details={
+                        "raw_payload": raw_payload_data,
+                    },
+                )
+                logger.info(
+                    "Successfully created resolution sensor_log entry (ID: %s) for sensor %s",
+                    getattr(log_entry, "log_id", "N/A"),
+                    sensor_id,
+                )
+            except RepositoryError:
+                logger.exception(
+                    "Failed to create resolution sensor_log for sensor %s", sensor_id
+                )
 
         logger.info(
             "Up workflow completed successfully for sensor %s (Log status set to CLOSED)",
@@ -72,5 +87,6 @@ class UpWorkflow:
 
 
 def process(payload):
+    logger.info("Received request to process Up workflow payload.")
     workflow = UpWorkflow()
     asyncio.run(workflow.execute(payload))

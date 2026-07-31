@@ -2,14 +2,20 @@ import logging
 import os
 import secrets
 
-from fastapi import FastAPI, Header, HTTPException, status, Depends
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from kombu.exceptions import OperationalError as KombuOperationalError
 
+from cache.redis_cache import CacheService, IncidentStateTracker
 from models.prtg_alert import PRTGWebhookPayload
 from task_queue.tasks import process_prtg_webhook_task
-from cache.redis_cache import CacheService, IncidentStateTracker
 
-logging.basicConfig(level=logging.INFO)
+# 1. Import and run your centralized logging configuration
+from config.logging_config import setup_logging
+
+# Call the setup function to apply the dictConfig
+setup_logging()
+
+# 2. Get standard module-level logger (no logging.basicConfig call)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="PRTG Webhook Gateway", version="1.0.0")
@@ -27,6 +33,7 @@ if not WEBHOOK_SECRET:
 
 def authenticate_prtg(x_prtg_token: str = Header(None, alias="X-PRTG-Token")):
     if not x_prtg_token or not secrets.compare_digest(x_prtg_token, WEBHOOK_SECRET):
+        logger.warning("Authentication failed: Invalid or missing X-PRTG-Token header")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing PRTG authentication token",
@@ -38,6 +45,7 @@ async def receive_prtg_webhook(
     payload: PRTGWebhookPayload,
     authenticated: None = Depends(authenticate_prtg),
 ):
+    logger.info(f"Received PRTG webhook for sensor_id: {payload.sensor_id}")
     payload_dict = payload.model_dump(mode="json")
 
     # --- Cache lookup is best-effort — never block queuing on it ---
@@ -45,12 +53,14 @@ async def receive_prtg_webhook(
         site_context = CacheService.get_sensor_site_info(payload.sensor_id)
         if site_context:
             payload_dict["site_context"] = site_context
+            logger.info(f"Enriched payload with site context for sensor {payload.sensor_id}")
     except Exception as exc:
         logger.warning(f"Site-context lookup failed for sensor {payload.sensor_id}: {exc}")
 
     # --- Publish to RabbitMQ — this IS critical, must fail loudly ---
     try:
         process_prtg_webhook_task.delay(payload_dict)
+        logger.info(f"Successfully queued PRTG task for sensor_id: {payload.sensor_id}")
     except KombuOperationalError as exc:
         logger.error(f"RabbitMQ unreachable while queuing sensor {payload.sensor_id}: {exc}")
         raise HTTPException(
@@ -58,7 +68,7 @@ async def receive_prtg_webhook(
             detail="Message broker unavailable — PRTG should retry this webhook",
         )
     except Exception as exc:
-        logger.error(f"Unexpected error publishing task for sensor {payload.sensor_id}: {exc}")
+        logger.error(f"Unexpected error publishing task for sensor {payload.sensor_id}: {exc}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to publish event to queue",
@@ -73,6 +83,7 @@ async def receive_prtg_webhook(
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 async def health_check():
+    logger.debug("Running health check status checks...")
     redis_ok = IncidentStateTracker.ping()
 
     broker_ok = True
@@ -84,8 +95,15 @@ async def health_check():
         logger.warning(f"Health check: broker unreachable: {exc}")
 
     healthy = redis_ok and broker_ok
+    status_str = "healthy" if healthy else "degraded"
+    
+    if not healthy:
+        logger.warning(f"Health check reported degraded status (Redis: {redis_ok}, Broker: {broker_ok})")
+    else:
+        logger.info("Health check status: healthy")
+
     return {
-        "status": "healthy" if healthy else "degraded",
+        "status": status_str,
         "redis": "up" if redis_ok else "down",
         "broker": "up" if broker_ok else "down",
     }

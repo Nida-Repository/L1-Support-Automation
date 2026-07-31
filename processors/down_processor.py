@@ -41,6 +41,8 @@ def _serialize_payload_for_json(payload) -> dict:
 class DownWorkflow:
 
     async def execute(self, payload):
+        logger.info("Executing DownWorkflow...")
+
         # Extract sensor_id safely
         if hasattr(payload, "sensor_id"):
             sensor_id = payload.sensor_id
@@ -52,6 +54,8 @@ class DownWorkflow:
         if not sensor_id:
             logger.error("Payload missing 'sensor_id': %s", payload)
             return
+
+        logger.info("Processing DownWorkflow for sensor_id: %s", sensor_id)
 
         with session_scope(SessionLocal) as session:
             sensor_repo = SensorRepository(session)
@@ -140,8 +144,20 @@ class DownWorkflow:
                 "alert_id": alert_id,  # may be None if alert creation failed above
             }
 
+            logger.info(
+                "Triggering PingIp diagnostic service for target IP %s (sensor_id=%s, alert_id=%s)",
+                primary_ip,
+                sensor_id,
+                alert_id,
+            )
+
             try:
                 ping_results = await ping_service.execute(ping_payload)
+                logger.info(
+                    "Ping service execution completed for sensor %s. Results: %s",
+                    sensor_id,
+                    ping_results,
+                )
             except Exception:
                 logger.exception(
                     "Ping service execution failed for sensor %s (alert_id=%s)",
@@ -153,9 +169,9 @@ class DownWorkflow:
             # Safely convert payload into JSON-serializable primitive dict
             raw_payload_data = _serialize_payload_for_json(payload)
 
-            # Create sensor_log entry (will now commit successfully)
+            # Create sensor_log entry
             try:
-                log_repo.create(
+                log_entry = log_repo.create(
                     sensor_id=sensor_id,
                     log_timestamp=datetime.datetime.now(datetime.timezone.utc),
                     log_level=LogLevelType.CRITICAL,
@@ -168,6 +184,11 @@ class DownWorkflow:
                         "ping_results": ping_results,
                         "raw_payload": raw_payload_data,
                     },
+                )
+                logger.info(
+                    "Successfully created sensor_log entry (ID: %s) for sensor %s",
+                    getattr(log_entry, "log_id", "N/A"),
+                    sensor_id,
                 )
             except RepositoryError:
                 logger.exception(
@@ -184,5 +205,6 @@ class DownWorkflow:
 
 
 def process(payload):
+    logger.info("Received request to process Down workflow payload.")
     workflow = DownWorkflow()
     asyncio.run(workflow.execute(payload))

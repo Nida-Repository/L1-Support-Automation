@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 from email_validator import EmailNotValidError, validate_email
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound, select_autoescape
 
-from app.database import SessionLocal
 from app.crud import (
     AlertHistoryRepository,
     ConstraintViolationError,
@@ -24,9 +23,11 @@ from app.crud import (
     SiteIspAssignmentRepository,
     session_scope,
 )
+from app.database import SessionLocal
 
 load_dotenv()
 
+# 1. Module Logger Definition
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
@@ -47,6 +48,20 @@ SUPPORT_TEAM_EMAIL = os.getenv("SUPPORT_TEAM_EMAIL")
 # templates/email/  (sibling of the app/ package -- adjust if your layout differs)
 TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "email"
 
+logger.info(
+    "Initializing Email Service [Host: %s:%d | TLS: %s | SSL: %s | From: %s]",
+    SMTP_HOST,
+    SMTP_PORT,
+    SMTP_USE_TLS,
+    SMTP_USE_SSL,
+    SMTP_FROM_ADDRESS,
+)
+
+if not TEMPLATE_DIR.exists():
+    logger.warning("Email template directory does not exist at path: %s", TEMPLATE_DIR)
+else:
+    logger.debug("Email template directory loaded: %s", TEMPLATE_DIR)
+
 _jinja_env = Environment(
     loader=FileSystemLoader(str(TEMPLATE_DIR)),
     autoescape=select_autoescape(["html", "xml"]),
@@ -64,13 +79,16 @@ class EmailDispatchError(Exception):
 # --------------------------------------------------------------------------- #
 
 def _render_template(template_name: str, context: Dict[str, Any]) -> str:
+    logger.debug("Rendering email template '%s' with context keys: %s", template_name, list(context.keys()))
     try:
         template = _jinja_env.get_template(template_name)
     except TemplateNotFound as exc:
         logger.error("Email template not found: %s (looked in %s)", template_name, TEMPLATE_DIR)
         raise EmailDispatchError(f"template not found: {template_name}") from exc
     try:
-        return template.render(**context)
+        rendered = template.render(**context)
+        logger.debug("Successfully rendered template '%s'", template_name)
+        return rendered
     except Exception as exc:
         logger.exception("Failed to render template %s", template_name)
         raise EmailDispatchError(f"failed to render template: {template_name}") from exc
@@ -80,7 +98,8 @@ def _validated(email_address: Optional[str]) -> Optional[str]:
     if not email_address:
         return None
     try:
-        return validate_email(email_address, check_deliverability=False).normalized
+        normalized_email = validate_email(email_address, check_deliverability=False).normalized
+        return normalized_email
     except EmailNotValidError as exc:
         logger.error("Invalid email address %r rejected: %s", email_address, exc)
         return None
@@ -98,6 +117,7 @@ def _send_email(
     body_html: str,
 ) -> None:
     if not to_addresses:
+        logger.error("Email dispatch attempted without target recipients (To: field is empty)")
         raise EmailDispatchError("no recipient addresses provided")
 
     msg = MIMEMultipart("alternative")
@@ -110,16 +130,32 @@ def _send_email(
 
     all_recipients = list(to_addresses) + list(cc_addresses or [])
 
+    logger.info(
+        "Attempting SMTP dispatch [Host: %s:%d] | To: %s | CC: %s | Subject: %r",
+        SMTP_HOST,
+        SMTP_PORT,
+        to_addresses,
+        cc_addresses or [],
+        subject,
+    )
+
     try:
         smtp_cls = smtplib.SMTP_SSL if SMTP_USE_SSL else smtplib.SMTP
+        logger.debug("Connecting to SMTP server using protocol class %s", smtp_cls.__name__)
+        
         with smtp_cls(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as server:
             server.ehlo()
             if SMTP_USE_TLS and not SMTP_USE_SSL:
+                logger.debug("Initiating STARTTLS for SMTP session...")
                 server.starttls()
                 server.ehlo()
             if SMTP_USERNAME and SMTP_PASSWORD:
+                logger.debug("Authenticating with SMTP server as user '%s'", SMTP_USERNAME)
                 server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            
             server.sendmail(SMTP_FROM_ADDRESS, all_recipients, msg.as_string())
+            logger.info("Email successfully sent via SMTP to %d recipient(s)", len(all_recipients))
+
     except smtplib.SMTPAuthenticationError as exc:
         logger.error("SMTP authentication failed against %s:%s -> %s", SMTP_HOST, SMTP_PORT, exc)
         raise EmailDispatchError("SMTP authentication failed") from exc
@@ -163,6 +199,8 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
     ping_diagnostic_id = payload.get("ping_diagnostic_id")
     ping_results = payload.get("ping_results") or {}
 
+    logger.info("Processing alert notification for site_id=%s, alert_id=%s", site_id, alert_id)
+
     if site_id is None:
         logger.error("send_alert_notification called without site_id; payload=%r", payload)
         return
@@ -177,6 +215,7 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
     # --- 1 & 2: circuit id, isp id, and ISP contact emails -----------------
     try:
         with session_scope(SessionLocal) as session:
+            logger.debug("Fetching primary ISP assignment for site_id=%s", site_id)
             assignment_repo = SiteIspAssignmentRepository(session)
             assignment = assignment_repo.get_primary_for_site(site_id)
             if assignment is None:
@@ -185,6 +224,7 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
             circuit_id = assignment.circuit_id
             isp_id = assignment.isp_id
 
+            logger.debug("Fetching active contact emails for isp_id=%s", isp_id)
             contact_repo = IspContactEmailRepository(session)
             isp_contacts = contact_repo.list_active_for_isp(isp_id)
     except NotFoundError:
@@ -252,6 +292,7 @@ def _handle_escalation(
     alert_id: int,
 ) -> None:
     """Render + send one escalation email, then persist the audit trail."""
+    logger.debug("Executing escalation handler for alert_id=%s to target '%s'", alert_id, escalated_to)
     try:
         subject = _render_template(subject_template, context).strip()
         body = _render_template(body_template, context)
@@ -283,6 +324,7 @@ def _handle_escalation(
     # Persist the escalation record + update alert_history regardless of
     # send success, so a failed send is still auditable via response_notes.
     try:
+        logger.debug("Persisting escalation audit log to database for alert_id=%s...", alert_id)
         with session_scope(SessionLocal) as session:
             escalation_repo = EscalationRecordRepository(session)
             escalation_repo.create(
@@ -319,6 +361,13 @@ def _handle_escalation(
 
 
 if __name__ == "__main__":
+    from config.logging_config import setup_logging
+    
+    # Initialize logging if module is run standalone
+    setup_logging()
+    
+    logger.info("Executing email notification module as standalone script...")
+    
     payload = {
         "site_id": 2198,
         "alert_id": 105,
@@ -331,4 +380,4 @@ if __name__ == "__main__":
         },
     }
 
-    send_alert_notification(payload)        
+    send_alert_notification(payload)
