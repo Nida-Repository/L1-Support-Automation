@@ -360,6 +360,98 @@ def _handle_escalation(
         logger.exception("Unexpected DB error recording escalation for alert_id=%s", alert_id)
 
 
+def send_warning_notification(payload: Dict[str, Any]) -> bool:
+
+    support_email = _validated(SUPPORT_TEAM_EMAIL)
+
+    if not support_email:
+        logger.error("SUPPORT_TEAM_EMAIL is not configured.")
+        return False  #  Return False on missing config
+
+    context = {
+        "site_name": payload["site_name"],
+        "sensor_name": payload["sensor_name"],
+        "status": payload["status"],
+        "message": payload["message"],
+        "timestamp": payload["timestamp"],
+    }
+
+    try:
+        subject = _render_template(
+            "warning_subject.txt",
+            context,
+        ).replace("\r", "").replace("\n", "").strip()
+
+        body = _render_template(
+            "warning_body.html",
+            context,
+        )
+
+        _send_email(
+            to_addresses=[support_email],
+            cc_addresses=None,
+            subject=subject,
+            body_html=body,
+        )
+
+        logger.info(
+            "Warning email sent successfully to support team."
+        )
+        return True  # Return True on success
+
+    except EmailDispatchError:
+        logger.exception(
+            "Failed to send warning email."
+        )
+        return False  #  Return False on exception
+
+
+def send_paused_notification(payload: Dict[str, Any]) -> bool:
+
+    support_email = _validated(SUPPORT_TEAM_EMAIL)
+
+    if not support_email:
+        logger.error("SUPPORT_TEAM_EMAIL is not configured.")
+        return False  #  Return False on missing config
+
+    context = {
+        "site_name": payload["site_name"],
+        "sensor_name": payload["sensor_name"],
+        "status": payload["status"],
+        "message": payload["message"],
+        "timestamp": payload["timestamp"],
+    }
+
+    try:
+        subject = _render_template(
+            "paused_subject.txt",
+            context,
+        ).replace("\r", "").replace("\n", "").strip()
+
+        body = _render_template(
+            "paused_body.html",
+            context,
+        )
+
+        _send_email(
+            to_addresses=[support_email],
+            cc_addresses=None,
+            subject=subject,
+            body_html=body,
+        )
+
+        logger.info(
+            "Sensor Paused email sent successfully to support team."
+        )
+        return True  # Return True on success
+
+    except EmailDispatchError:
+        logger.exception(
+            "Failed to send warning email."
+        )
+        return False  #  Return False on exception
+
+
 if __name__ == "__main__":
     from config.logging_config import setup_logging
     
