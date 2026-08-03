@@ -1,0 +1,1 @@
+[Network Alert] {{ status }} - {{ sensor_name }} at {{ site_name }}
