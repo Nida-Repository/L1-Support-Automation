@@ -20,7 +20,6 @@ from services.ping_service import PingIp
 logger = logging.getLogger(__name__)
 
 # Name of the ALERT_STATES row that represents a sensor-down condition.
-# Adjust to match whatever value is actually seeded in your ALERT_STATES table.
 DOWN_STATE_NAME = "Down"
 
 
