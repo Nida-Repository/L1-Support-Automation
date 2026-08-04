@@ -27,11 +27,11 @@ from app.database import SessionLocal
 
 load_dotenv()
 
-# 1. Module Logger Definition
+# Module Logger Definition
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
-# Configuration (all pulled from .env)
+# Configuration (pulled from .env)
 # --------------------------------------------------------------------------- #
 
 SMTP_HOST = os.getenv("SMTP_HOST", "localhost")
@@ -45,7 +45,7 @@ SMTP_TIMEOUT_SECONDS = float(os.getenv("SMTP_TIMEOUT_SECONDS", "15"))
 
 SUPPORT_TEAM_EMAIL = os.getenv("SUPPORT_TEAM_EMAIL")
 
-# templates/email/  (sibling of the app/ package -- adjust if your layout differs)
+# templates/email/  (sibling of the app/)
 TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "email"
 
 logger.info(
@@ -186,8 +186,7 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
       1. Looks up the site's primary ISP assignment -> circuit_id + isp_id.
       2. Looks up the ISP's active contact emails.
       3. Renders and sends a single email to the primary ISP contact, CC'ing
-         any secondary ISP contacts plus the internal support team (address
-         from .env).
+         ONLY the internal support team (address from .env).
       4. Persists one EscalationRecord row for the email, and updates
          ALERT_HISTORY.escalation_status accordingly.
 
@@ -212,7 +211,7 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
         )
         return
 
-    # --- 1 & 2: circuit id, isp id, and ISP contact emails -----------------
+    # ---  circuit id, isp id, and ISP contact emails -----------------
     try:
         with session_scope(SessionLocal) as session:
             logger.debug("Fetching primary ISP assignment for site_id=%s", site_id)
@@ -237,10 +236,8 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
         logger.exception("Unexpected error looking up ISP details for site_id=%s", site_id)
         return
 
+    # Only extract the primary contact email (first in list)
     isp_recipient = _validated(isp_contacts[0].email_address) if isp_contacts else None
-    isp_cc = [
-        e for e in (_validated(c.email_address) for c in isp_contacts[1:]) if e is not None
-    ]
 
     support_recipient = _validated(SUPPORT_TEAM_EMAIL)
     if not support_recipient:
@@ -257,8 +254,7 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
         "max_rtt_ms": ping_results.get("max_rtt_ms"),
     }
 
-    # --- 3 & 4: single email to the ISP, with any secondary ISP contacts
-    # and the internal support team CC'd -------------------------------------
+    # --- single email to primary ISP contact, CC'ing ONLY support team ---
     if not isp_recipient:
         logger.error(
             "No usable active contact email for isp_id=%s (site_id=%s); escalation email not sent.",
@@ -266,14 +262,15 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
         )
         return
 
-    cc_list: List[str] = isp_cc or []
+    # Build CC list with only support_recipient (if available)
+    cc_list: List[str] = []
     if support_recipient:
         cc_list.append(support_recipient)
 
     _handle_escalation(
         escalated_to="ISP",
         recipient_email=isp_recipient,
-        cc_emails=cc_list,
+        cc_emails=cc_list if cc_list else None,
         subject_template="isp_alert_subject.txt",
         body_template="isp_alert_body.html",
         context=template_context,
@@ -361,22 +358,21 @@ def _handle_escalation(
 
 
 def send_warning_notification(payload: Dict[str, Any]) -> bool:
-
     support_email = _validated(SUPPORT_TEAM_EMAIL)
 
     if not support_email:
         logger.error("SUPPORT_TEAM_EMAIL is not configured.")
-        return False  #  Return False on missing config
-
-    context = {
-        "site_name": payload["site_name"],
-        "sensor_name": payload["sensor_name"],
-        "status": payload["status"],
-        "message": payload["message"],
-        "timestamp": payload["timestamp"],
-    }
+        return False
 
     try:
+        context = {
+            "site_name": payload.get("site_name") or payload.get("device", "Unknown Site"),
+            "sensor_name": payload.get("sensor_name") or payload.get("sensor", "Unknown Sensor"),
+            "status": payload.get("status", "Warning"),
+            "message": payload.get("message") or payload.get("lastvalue", "No message provided"),
+            "timestamp": payload.get("timestamp") or payload.get("datetime", ""),
+        }
+
         subject = _render_template(
             "warning_subject.txt",
             context,
@@ -394,35 +390,30 @@ def send_warning_notification(payload: Dict[str, Any]) -> bool:
             body_html=body,
         )
 
-        logger.info(
-            "Warning email sent successfully to support team."
-        )
-        return True  # Return True on success
+        logger.info("Warning email sent successfully to support team.")
+        return True
 
-    except EmailDispatchError:
-        logger.exception(
-            "Failed to send warning email."
-        )
-        return False  #  Return False on exception
+    except (EmailDispatchError, Exception) as exc:
+        logger.exception("Failed to send warning email: %s", exc)
+        return False
 
 
 def send_paused_notification(payload: Dict[str, Any]) -> bool:
-
     support_email = _validated(SUPPORT_TEAM_EMAIL)
 
     if not support_email:
         logger.error("SUPPORT_TEAM_EMAIL is not configured.")
-        return False  #  Return False on missing config
-
-    context = {
-        "site_name": payload["site_name"],
-        "sensor_name": payload["sensor_name"],
-        "status": payload["status"],
-        "message": payload["message"],
-        "timestamp": payload["timestamp"],
-    }
+        return False
 
     try:
+        context = {
+            "site_name": payload.get("site_name") or payload.get("device", "Unknown Site"),
+            "sensor_name": payload.get("sensor_name") or payload.get("sensor", "Unknown Sensor"),
+            "status": payload.get("status", "Paused"),
+            "message": payload.get("message") or payload.get("lastvalue", "No message provided"),
+            "timestamp": payload.get("timestamp") or payload.get("datetime", ""),
+        }
+
         subject = _render_template(
             "paused_subject.txt",
             context,
@@ -440,17 +431,12 @@ def send_paused_notification(payload: Dict[str, Any]) -> bool:
             body_html=body,
         )
 
-        logger.info(
-            "Sensor Paused email sent successfully to support team."
-        )
-        return True  # Return True on success
+        logger.info("Sensor Paused email sent successfully to support team.")
+        return True
 
-    except EmailDispatchError:
-        logger.exception(
-            "Failed to send warning email."
-        )
-        return False  #  Return False on exception
-
+    except (EmailDispatchError, Exception) as exc:
+        logger.exception("Failed to send paused email: %s", exc)
+        return False
 
 if __name__ == "__main__":
     from config.logging_config import setup_logging

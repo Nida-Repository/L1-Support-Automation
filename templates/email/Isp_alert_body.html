@@ -14,31 +14,9 @@
         <td style="border: 1px solid #dddddd;">{{ circuit_id }}</td>
       </tr>
       <tr>
-        <td style="border: 1px solid #dddddd;"><strong>Site ID</strong></td>
-        <td style="border: 1px solid #dddddd;">{{ site_id }}</td>
-      </tr>
-      <tr style="background-color: #f5f5f5;">
-        <td style="border: 1px solid #dddddd;"><strong>Alert ID</strong></td>
-        <td style="border: 1px solid #dddddd;">{{ alert_id }}</td>
-      </tr>
-      {% if ping_diagnostic_id %}
-      <tr>
-        <td style="border: 1px solid #dddddd;"><strong>Ping Diagnostic ID</strong></td>
-        <td style="border: 1px solid #dddddd;">{{ ping_diagnostic_id }}</td>
-      </tr>
-      {% endif %}
-      <tr style="background-color: #f5f5f5;">
         <td style="border: 1px solid #dddddd;"><strong>Packet Loss</strong></td>
         <td style="border: 1px solid #dddddd;">
           {{ packet_loss_percent if packet_loss_percent is not none else "N/A" }}%
-        </td>
-      </tr>
-      <tr>
-        <td style="border: 1px solid #dddddd;"><strong>Min / Avg / Max RTT (ms)</strong></td>
-        <td style="border: 1px solid #dddddd;">
-          {{ min_rtt_ms if min_rtt_ms is not none else "N/A" }} /
-          {{ avg_rtt_ms if avg_rtt_ms is not none else "N/A" }} /
-          {{ max_rtt_ms if max_rtt_ms is not none else "N/A" }}
         </td>
       </tr>
     </table>

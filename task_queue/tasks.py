@@ -15,7 +15,7 @@ from processors import (
 from task_queue.celery_app import celery_app
 
 
-# 1. Use Celery's task logger to include task context (task_id, task_name) automatically
+# Use logger to include task context (task_id, task_name) automatically
 logger = get_task_logger(__name__)
 
 STATUS_PROCESSORS = {

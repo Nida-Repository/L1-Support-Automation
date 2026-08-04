@@ -1,1 +1,1 @@
-Network Outage Alert - Circuit {{ circuit_id }} (Site {{ site_id }}) - Alert #{{ alert_id }}
+Network Outage Alert - Circuit {{ circuit_id }}

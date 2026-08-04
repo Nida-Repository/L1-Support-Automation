@@ -18,8 +18,6 @@ class SensorStatus(str, Enum):
     WARNING = "Warning"
     UNUSUAL = "Unusual"
     PAUSED = "Paused"
-    # UNKNOWN = "Unknown"
-    # DOWN_ACKNOWLEDGED = "Down (Acknowledged)"
 
 
 class PRTGWebhookPayload(BaseModel):
@@ -27,10 +25,10 @@ class PRTGWebhookPayload(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,   # allows instantiation via field name OR alias
         str_strip_whitespace=True,
-        extra="ignore",          # don't 422 on extra PRTG placeholders you didn't map
+        extra="ignore",          # don't 422 on extra PRTG placeholders
         json_schema_extra={
             "example": {
-                "sensorid": "12345",
+                "sensorid": "1234",
                 "sensorname": "Ping",
                 "device": "core-switch-01",
                 "host": "10.10.1.1",
@@ -47,22 +45,19 @@ class PRTGWebhookPayload(BaseModel):
     )
 
     # --- Core sensor details ---
-    # MANDATORY FIELDS:
-    #                  SENSOR ID, SENSOR NAME, STATUS
+    # MANDATORY FIELDS:   SENSOR ID, SENSOR NAME, STATUS
+
     sensor_id: int = Field(..., alias="sensorid")
     sensor_name: str = Field(..., alias="sensorname")
-    device_name: Optional[str] = Field(default=None, alias="lastup")
-    host_ip: Optional[str] = Field(default=None, alias="lastup")
+    device_name: Optional[str] = Field(default=None, alias="device")
+    host_ip: Optional[str] = Field(default=None, alias="host")
     status: SensorStatus = Field(..., alias="laststatus")
     message: Optional[str] = Field(default=None, alias="message")
 
     # --- Timestamps ---
-    # Server-side receipt time - NOT sent by PRTG, always current UTC time.
     received_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
-    # PRTG timestamp placeholders come in PRTG's own locale-dependent
-    # date format, not ISO 8601 - keep as raw strings, don't force datetime.
     last_check: Optional[str] = Field(default=None, alias="lastcheck")
     last_up: Optional[str] = Field(default=None, alias="lastup")
     last_down: Optional[str] = Field(default=None, alias="lastdown")

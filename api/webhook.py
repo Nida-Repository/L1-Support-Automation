@@ -9,13 +9,11 @@ from cache.redis_cache import CacheService, IncidentStateTracker
 from models.prtg_alert import PRTGWebhookPayload
 from task_queue.tasks import process_prtg_webhook_task
 
-# 1. Import and run your centralized logging configuration
+#  Import and run your centralized logging configuration
 from config.logging_config import setup_logging
-
-# Call the setup function to apply the dictConfig
 setup_logging()
 
-# 2. Get standard module-level logger (no logging.basicConfig call)
+#  Get standard module-level logger 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="PRTG Webhook Gateway", version="1.0.0")

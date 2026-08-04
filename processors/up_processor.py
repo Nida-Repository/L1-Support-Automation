@@ -54,10 +54,8 @@ class UpWorkflow:
                 logger.error("Sensor with ID %s not found.", sensor_id)
                 return
 
-            # Option A: If your log_repo has an update function (e.g. update_status_by_sensor)
-            # log_repo.close_open_logs_for_sensor(sensor_id)
 
-            # Option B: Create a resolution log entry marking the state as CLOSED
+            # Create a resolution log entry marking the state as CLOSED
             raw_payload_data = _serialize_payload_for_json(payload)
             try:
                 log_entry = log_repo.create(

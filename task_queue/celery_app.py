@@ -103,8 +103,7 @@ logger.info("Celery queues and exchanges configured successfully.")
 def setup_celery_logging(logger, format, loglevel, plaintext, **kwargs):
     """
     Re-apply dictConfig after Celery's own logger setup runs, as a safety net.
-    With worker_hijack_root_logger=False this shouldn't be strictly necessary,
-    but it guarantees your config wins either way.
+    With worker_hijack_root_logger=False.
     """
     logging.config.dictConfig(LOGGING_CONFIG)
     logger.info("Custom dictConfig successfully applied to Celery loggers.")
