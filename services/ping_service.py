@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import ipaddress
 import logging
+import os
 import platform
 import re
 import shutil
@@ -38,20 +39,55 @@ SUBPROCESS_WAIT_MARGIN_SECONDS = 1.0
 
 SMTP_DISPATCH_TIMEOUT_SECONDS = 30.0
 
+
+MAX_CONCURRENT_DIAGNOSTIC_JOBS = int(os.environ.get("PING_DIAG_MAX_CONCURRENT_JOBS", "5"))
+
+
+MAX_CONCURRENT_PING_SUBPROCESSES = int(os.environ.get("PING_DIAG_MAX_CONCURRENT_PINGS", "20"))
+
 _HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-.]*[A-Za-z0-9])?$")
 _RTT_RE = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.IGNORECASE)
 
 logger.info(
-    "Initializing Ping Diagnostic Service [Batches: %d | Pings/Batch: %d | Timeout: %.1fs | Pause: %.1fs]",
+    "Initializing Ping Diagnostic Service [Batches: %d | Pings/Batch: %d | Timeout: %.1fs | Pause: %.1fs | "
+    "MaxConcurrentJobs: %d | MaxConcurrentPings: %d]",
     BATCH_COUNT,
     PINGS_PER_BATCH,
     PING_TIMEOUT_SECONDS,
     PAUSE_BETWEEN_BATCHES_SECONDS,
+    MAX_CONCURRENT_DIAGNOSTIC_JOBS,
+    MAX_CONCURRENT_PING_SUBPROCESSES,
 )
 
 
 class PayloadValidationError(ValueError):
     """Raised when the incoming Celery payload is missing fields or malformed."""
+
+
+def _get_job_semaphore() -> asyncio.Semaphore:
+    """Lazily create the job-level semaphore bound to the running event loop.
+
+    Each Celery task runs its own asyncio.run(), i.e. its own event loop, so
+    a semaphore created at import time (before any loop exists) would be
+    bound to nothing / the wrong loop. Creating it on first use inside the
+    running loop keeps this safe.
+    """
+    loop = asyncio.get_event_loop()
+    sem = getattr(loop, "_ping_diag_job_semaphore", None)
+    if sem is None:
+        sem = asyncio.Semaphore(MAX_CONCURRENT_DIAGNOSTIC_JOBS)
+        loop._ping_diag_job_semaphore = sem  # type: ignore[attr-defined]
+    return sem
+
+
+def _get_ping_semaphore() -> asyncio.Semaphore:
+    """Lazily create the subprocess-level semaphore bound to the running event loop."""
+    loop = asyncio.get_event_loop()
+    sem = getattr(loop, "_ping_diag_ping_semaphore", None)
+    if sem is None:
+        sem = asyncio.Semaphore(MAX_CONCURRENT_PING_SUBPROCESSES)
+        loop._ping_diag_ping_semaphore = sem  # type: ignore[attr-defined]
+    return sem
 
 
 class PingIp:
@@ -85,61 +121,71 @@ class PingIp:
             )
             return
 
-        site_recovered = False
-        last_ping_result: Optional[Dict[str, Any]] = None
-
-        try:
-            for batch_index in range(1, BATCH_COUNT + 1):
-                logger.info(
-                    "Executing ping batch %d/%d for target=%s (site_id=%s)",
-                    batch_index, BATCH_COUNT, target_ip, site_id
-                )
-
-                try:
-                    batch_result = await self._run_ping_batch(
-                        target_ip, PINGS_PER_BATCH, PING_TIMEOUT_SECONDS
-                    )
-                except Exception:
-                    logger.exception(
-                        "Unexpected error running batch %d/%d for target=%s; treating as 100%% loss",
-                        batch_index, BATCH_COUNT, target_ip,
-                    )
-                    batch_result = self._empty_result("batch execution error")
-
-                last_ping_result = batch_result
-
-                loss_pct = batch_result.get("packet_loss_percent", Decimal("100.00"))
-                logger.debug(
-                    "Batch %d/%d result for %s: loss=%s%%, avg_rtt=%s ms",
-                    batch_index, BATCH_COUNT, target_ip, loss_pct, batch_result.get("avg_rtt_ms")
-                )
-
-                if loss_pct < Decimal("100.00"):
-                    logger.info(
-                        "Site target=%s recovered on batch %d/%d (packet loss: %s%%)",
-                        target_ip, batch_index, BATCH_COUNT, loss_pct
-                    )
-                    site_recovered = True
-                    break
-
-                if batch_index < BATCH_COUNT:
-                    logger.warning(
-                        "Batch %d/%d failed for target=%s (100%% loss). Pausing %.1fs before next batch...",
-                        batch_index, BATCH_COUNT, target_ip, PAUSE_BETWEEN_BATCHES_SECONDS,
-                    )
-                    await asyncio.sleep(PAUSE_BETWEEN_BATCHES_SECONDS)
-
-        except asyncio.CancelledError:
-            logger.warning("Ping diagnostic job for site_id=%s (target=%s) was cancelled mid-flight.", site_id, target_ip)
-            raise
-
-        if site_recovered:
-            self._on_site_recovered(sensor_id, target_ip)
-        else:
-            logger.warning("Target=%s remained unreachable across all %d batches for site_id=%s", target_ip, BATCH_COUNT, site_id)
-            await self._on_site_unreachable(
-                site_id=site_id, alert_id=alert_id, ping_result=last_ping_result,
+        job_semaphore = _get_job_semaphore()
+        waiting_for_slot = job_semaphore.locked()
+        if waiting_for_slot:
+            logger.info(
+                "Diagnostic job for site_id=%s (target=%s) is queued, waiting for a free execution slot "
+                "(max concurrent jobs=%d)",
+                site_id, target_ip, MAX_CONCURRENT_DIAGNOSTIC_JOBS,
             )
+
+        async with job_semaphore:
+            site_recovered = False
+            last_ping_result: Optional[Dict[str, Any]] = None
+
+            try:
+                for batch_index in range(1, BATCH_COUNT + 1):
+                    logger.info(
+                        "Executing ping batch %d/%d for target=%s (site_id=%s)",
+                        batch_index, BATCH_COUNT, target_ip, site_id
+                    )
+
+                    try:
+                        batch_result = await self._run_ping_batch(
+                            target_ip, PINGS_PER_BATCH, PING_TIMEOUT_SECONDS
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Unexpected error running batch %d/%d for target=%s; treating as 100%% loss",
+                            batch_index, BATCH_COUNT, target_ip,
+                        )
+                        batch_result = self._empty_result("batch execution error")
+
+                    last_ping_result = batch_result
+
+                    loss_pct = batch_result.get("packet_loss_percent", Decimal("100.00"))
+                    logger.debug(
+                        "Batch %d/%d result for %s: loss=%s%%, avg_rtt=%s ms",
+                        batch_index, BATCH_COUNT, target_ip, loss_pct, batch_result.get("avg_rtt_ms")
+                    )
+
+                    if loss_pct < Decimal("100.00"):
+                        logger.info(
+                            "Site target=%s recovered on batch %d/%d (packet loss: %s%%)",
+                            target_ip, batch_index, BATCH_COUNT, loss_pct
+                        )
+                        site_recovered = True
+                        break
+
+                    if batch_index < BATCH_COUNT:
+                        logger.warning(
+                            "Batch %d/%d failed for target=%s (100%% loss). Pausing %.1fs before next batch...",
+                            batch_index, BATCH_COUNT, target_ip, PAUSE_BETWEEN_BATCHES_SECONDS,
+                        )
+                        await asyncio.sleep(PAUSE_BETWEEN_BATCHES_SECONDS)
+
+            except asyncio.CancelledError:
+                logger.warning("Ping diagnostic job for site_id=%s (target=%s) was cancelled mid-flight.", site_id, target_ip)
+                raise
+
+            if site_recovered:
+                self._on_site_recovered(sensor_id, target_ip)
+            else:
+                logger.warning("Target=%s remained unreachable across all %d batches for site_id=%s", target_ip, BATCH_COUNT, site_id)
+                await self._on_site_unreachable(
+                    site_id=site_id, alert_id=alert_id, ping_result=last_ping_result,
+                )
 
     # ------------------------------------------------------------------ #
     # Payload validation
@@ -197,20 +243,31 @@ class PingIp:
     async def _run_ping_batch(
         self, target_ip: str, count: int, timeout_per_ping: float
     ) -> Dict[str, Any]:
-        logger.debug("Starting ping execution loop for target=%s | count=%d | timeout=%.1fs", target_ip, count, timeout_per_ping)
-        successful_rtts: List[Decimal] = []
-        packets_sent = 0
+        logger.debug(
+            "Starting ping execution for target=%s | count=%d | timeout=%.1fs | max_concurrent_pings=%d",
+            target_ip, count, timeout_per_ping, MAX_CONCURRENT_PING_SUBPROCESSES,
+        )
 
-        for idx in range(1, count + 1):
-            packets_sent += 1
-            try:
-                rtt = await self._single_ping(target_ip, timeout_per_ping)
-            except Exception:
-                logger.exception("Unhandled error on ping attempt %d/%d to %s; counting as loss", idx, count, target_ip)
-                rtt = None
+        ping_semaphore = _get_ping_semaphore()
 
-            if rtt is not None:
-                successful_rtts.append(rtt)
+        async def _bounded_single_ping(attempt_idx: int) -> Optional[Decimal]:
+            async with ping_semaphore:
+                try:
+                    return await self._single_ping(target_ip, timeout_per_ping)
+                except Exception:
+                    logger.exception(
+                        "Unhandled error on ping attempt %d/%d to %s; counting as loss",
+                        attempt_idx, count, target_ip,
+                    )
+                    return None
+
+
+        results = await asyncio.gather(
+            *(_bounded_single_ping(idx) for idx in range(1, count + 1))
+        )
+
+        packets_sent = count
+        successful_rtts: List[Decimal] = [rtt for rtt in results if rtt is not None]
 
         received = len(successful_rtts)
         loss_percent = (
