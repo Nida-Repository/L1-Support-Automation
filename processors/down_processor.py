@@ -56,11 +56,16 @@ class DownWorkflow:
 
         logger.info("Processing DownWorkflow for sensor_id: %s", sensor_id)
 
+        # -----------------------------------------------------------
+        # Transaction 1: fetch sensor/assignment/site and create the
+        # alert_history row. This block commits (via session_scope) as
+        # soon as we leave it, so the alert row is durably visible to
+        # anything else (e.g. PingIp) before we call out to it below.
+        # -----------------------------------------------------------
         with session_scope(SessionLocal) as session:
             sensor_repo = SensorRepository(session)
             assignment_repo = SiteIspAssignmentRepository(session)
             site_repo = SiteRepository(session)
-            log_repo = SensorLogRepository(session)
             alert_state_repo = AlertStateRepository(session)
             alert_repo = AlertHistoryRepository(session)
 
@@ -97,11 +102,6 @@ class DownWorkflow:
                 primary_ip,
             )
 
-            # -----------------------------------------------------------
-            # Create alert_history row BEFORE running the ping diagnostic,
-            # so the resulting alert_id can be attached to the ping result
-            # and to the sensor_log entry below.
-            # -----------------------------------------------------------
             alert_id = None
             try:
                 down_state = alert_state_repo.get_by_name(DOWN_STATE_NAME)
@@ -133,42 +133,52 @@ class DownWorkflow:
                 logger.exception(
                     "Unexpected error creating alert_history for sensor %s", sensor_id
                 )
+        # <- session_scope commits here. alert_history (if created) is now
+        # durably persisted, so PingIp can safely see/reference alert_id.
 
-            # Execute ping service
-            ping_service = PingIp()
-            ping_payload = {
-                "site_id": site_id,
-                "target_ip": primary_ip,
-                "sensor_id": sensor_id,
-                "alert_id": alert_id,  # may be None if alert creation failed above
-            }
+        # -----------------------------------------------------------
+        # Ping diagnostic runs outside of any DB transaction.
+        # -----------------------------------------------------------
+        ping_service = PingIp()
+        ping_payload = {
+            "site_id": site_id,
+            "target_ip": primary_ip,
+            "sensor_id": sensor_id,
+            "alert_id": alert_id,  # may be None if alert creation failed above
+        }
 
+        logger.info(
+            "Triggering PingIp diagnostic service for target IP %s (sensor_id=%s, alert_id=%s)",
+            primary_ip,
+            sensor_id,
+            alert_id,
+        )
+
+        try:
+            ping_results = await ping_service.execute(ping_payload)
             logger.info(
-                "Triggering PingIp diagnostic service for target IP %s (sensor_id=%s, alert_id=%s)",
-                primary_ip,
+                "Ping service execution completed for sensor %s. Results: %s",
+                sensor_id,
+                ping_results,
+            )
+        except Exception:
+            logger.exception(
+                "Ping service execution failed for sensor %s (alert_id=%s)",
                 sensor_id,
                 alert_id,
             )
+            ping_results = None
 
-            try:
-                ping_results = await ping_service.execute(ping_payload)
-                logger.info(
-                    "Ping service execution completed for sensor %s. Results: %s",
-                    sensor_id,
-                    ping_results,
-                )
-            except Exception:
-                logger.exception(
-                    "Ping service execution failed for sensor %s (alert_id=%s)",
-                    sensor_id,
-                    alert_id,
-                )
-                ping_results = None
+        # Safely convert payload into JSON-serializable primitive dict
+        raw_payload_data = _serialize_payload_for_json(payload)
 
-            # Safely convert payload into JSON-serializable primitive dict
-            raw_payload_data = _serialize_payload_for_json(payload)
+        # -----------------------------------------------------------
+        # Transaction 2: create the sensor_log entry in its own
+        # transaction
+        # -----------------------------------------------------------
+        with session_scope(SessionLocal) as session:
+            log_repo = SensorLogRepository(session)
 
-            # Create sensor_log entry
             try:
                 log_entry = log_repo.create(
                     sensor_id=sensor_id,

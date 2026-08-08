@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 BATCH_COUNT = 10
 PINGS_PER_BATCH = 10
 PING_TIMEOUT_SECONDS = 4.0
-PAUSE_BETWEEN_BATCHES_SECONDS = 81.0
+PAUSE_BETWEEN_BATCHES_SECONDS = 1.0
 
 SUBPROCESS_KILL_GRACE_SECONDS = 2.0
 SUBPROCESS_WAIT_MARGIN_SECONDS = 1.0
@@ -490,7 +490,7 @@ class PingIp:
 
         logger.debug("Attempting SMTP notification dispatch for site_id=%s...", site_id)
         try:
-            from client.smtp_client import send_alert_notification  # type: ignore
+            from clients.smtp_client import send_alert_notification  # type: ignore
         except ImportError:
             logger.exception("Could not import send_alert_notification from client.smtp_client; skipping dispatch")
             return
