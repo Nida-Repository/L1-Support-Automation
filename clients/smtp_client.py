@@ -1,14 +1,18 @@
+"""SMTP Email Client and Notification Dispatcher.
+
+Handles Jinja2 template rendering, MIME composition, SMTP dispatch over TLS/SSL,
+and escalation audit trail persistence in PostgreSQL.
+"""
 from __future__ import annotations
 
 import logging
-import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import make_msgid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from dotenv import load_dotenv
 from email_validator import EmailNotValidError, validate_email
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound, select_autoescape
 
@@ -24,37 +28,19 @@ from app.crud import (
     session_scope,
 )
 from app.database import SessionLocal
+from config.settings import settings
 
-load_dotenv()
-
-# Module Logger Definition
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------- #
-# Configuration (pulled from .env)
-# --------------------------------------------------------------------------- #
-
-SMTP_HOST = os.getenv("SMTP_HOST", "localhost")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").strip().lower() == "true"
-SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "false").strip().lower() == "true"
-SMTP_FROM_ADDRESS = os.getenv("SMTP_FROM_ADDRESS", "noreply@example.com")
-SMTP_TIMEOUT_SECONDS = float(os.getenv("SMTP_TIMEOUT_SECONDS", "15"))
-
-SUPPORT_TEAM_EMAIL = os.getenv("SUPPORT_TEAM_EMAIL")
-
-# templates/email/  (sibling of the app/)
-TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "email"
+TEMPLATE_DIR = settings.project_root / "templates" / "email"
 
 logger.info(
     "Initializing Email Service [Host: %s:%d | TLS: %s | SSL: %s | From: %s]",
-    SMTP_HOST,
-    SMTP_PORT,
-    SMTP_USE_TLS,
-    SMTP_USE_SSL,
-    SMTP_FROM_ADDRESS,
+    settings.smtp_host,
+    settings.smtp_port,
+    settings.smtp_use_tls,
+    settings.smtp_use_ssl,
+    settings.smtp_from_address,
 )
 
 if not TEMPLATE_DIR.exists():
@@ -71,11 +57,12 @@ _jinja_env = Environment(
 
 
 class EmailDispatchError(Exception):
-    """Raised when an email could not be rendered or sent."""
+    """Raised when an email cannot be rendered or dispatched."""
+    pass
 
 
 # --------------------------------------------------------------------------- #
-# Template rendering
+# Template Rendering & Email Validation
 # --------------------------------------------------------------------------- #
 
 def _render_template(template_name: str, context: Dict[str, Any]) -> str:
@@ -95,10 +82,10 @@ def _render_template(template_name: str, context: Dict[str, Any]) -> str:
 
 
 def _validated(email_address: Optional[str]) -> Optional[str]:
-    if not email_address:
+    if not email_address or not email_address.strip():
         return None
     try:
-        normalized_email = validate_email(email_address, check_deliverability=False).normalized
+        normalized_email = validate_email(email_address.strip(), check_deliverability=False).normalized
         return normalized_email
     except EmailNotValidError as exc:
         logger.error("Invalid email address %r rejected: %s", email_address, exc)
@@ -106,7 +93,7 @@ def _validated(email_address: Optional[str]) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- #
-# SMTP transport
+# SMTP Transport
 # --------------------------------------------------------------------------- #
 
 def _send_email(
@@ -115,83 +102,78 @@ def _send_email(
     cc_addresses: Optional[List[str]],
     subject: str,
     body_html: str,
-) -> None:
+) -> str:
     if not to_addresses:
         logger.error("Email dispatch attempted without target recipients (To: field is empty)")
         raise EmailDispatchError("no recipient addresses provided")
 
+    domain = settings.smtp_from_address.split("@")[-1] if "@" in settings.smtp_from_address else None
+    msg_id = make_msgid(domain=domain)
+
     msg = MIMEMultipart("alternative")
+    msg["Message-ID"] = msg_id
     msg["Subject"] = subject
-    msg["From"] = SMTP_FROM_ADDRESS
+    msg["From"] = settings.smtp_from_address
     msg["To"] = ", ".join(to_addresses)
     if cc_addresses:
         msg["Cc"] = ", ".join(cc_addresses)
-    msg.attach(MIMEText(body_html, "html"))
+    msg.attach(MIMEText(body_html, "html", "utf-8"))
 
     all_recipients = list(to_addresses) + list(cc_addresses or [])
 
     logger.info(
-        "Attempting SMTP dispatch [Host: %s:%d] | To: %s | CC: %s | Subject: %r",
-        SMTP_HOST,
-        SMTP_PORT,
+        "Attempting SMTP dispatch [Host: %s:%d] | Message-ID: %s | To: %s | CC: %s | Subject: %r",
+        settings.smtp_host,
+        settings.smtp_port,
+        msg_id,
         to_addresses,
         cc_addresses or [],
         subject,
     )
 
     try:
-        smtp_cls = smtplib.SMTP_SSL if SMTP_USE_SSL else smtplib.SMTP
-        logger.debug("Connecting to SMTP server using protocol class %s", smtp_cls.__name__)
-        
-        with smtp_cls(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as server:
+        smtp_cls = smtplib.SMTP_SSL if settings.smtp_use_ssl else smtplib.SMTP
+        logger.debug("Connecting to SMTP server using %s", smtp_cls.__name__)
+
+        with smtp_cls(settings.smtp_host, settings.smtp_port, timeout=settings.smtp_timeout_seconds) as server:
             server.ehlo()
-            if SMTP_USE_TLS and not SMTP_USE_SSL:
+            if settings.smtp_use_tls and not settings.smtp_use_ssl:
                 logger.debug("Initiating STARTTLS for SMTP session...")
                 server.starttls()
                 server.ehlo()
-            if SMTP_USERNAME and SMTP_PASSWORD:
-                logger.debug("Authenticating with SMTP server as user '%s'", SMTP_USERNAME)
-                server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            
-            server.sendmail(SMTP_FROM_ADDRESS, all_recipients, msg.as_string())
+            if settings.smtp_username and settings.smtp_password:
+                logger.debug("Authenticating with SMTP server as user '%s'", settings.smtp_username)
+                server.login(settings.smtp_username, settings.smtp_password)
+
+            server.sendmail(settings.smtp_from_address, all_recipients, msg.as_string())
             logger.info("Email successfully sent via SMTP to %d recipient(s)", len(all_recipients))
+            return msg_id
 
     except smtplib.SMTPAuthenticationError as exc:
-        logger.error("SMTP authentication failed against %s:%s -> %s", SMTP_HOST, SMTP_PORT, exc)
+        logger.error("SMTP authentication failed against %s:%s -> %s", settings.smtp_host, settings.smtp_port, exc)
         raise EmailDispatchError("SMTP authentication failed") from exc
     except smtplib.SMTPRecipientsRefused as exc:
         logger.error("SMTP server refused recipients %s: %s", all_recipients, exc)
         raise EmailDispatchError("recipients refused by SMTP server") from exc
     except smtplib.SMTPConnectError as exc:
-        logger.error("Could not connect to SMTP server %s:%s -> %s", SMTP_HOST, SMTP_PORT, exc)
+        logger.error("Could not connect to SMTP server %s:%s -> %s", settings.smtp_host, settings.smtp_port, exc)
         raise EmailDispatchError("could not connect to SMTP server") from exc
     except smtplib.SMTPException as exc:
         logger.error("SMTP error while sending mail: %s", exc)
         raise EmailDispatchError("SMTP error") from exc
     except (TimeoutError, OSError) as exc:
-        logger.error("Network error contacting SMTP host %s:%s -> %s", SMTP_HOST, SMTP_PORT, exc)
+        logger.error("Network error contacting SMTP host %s:%s -> %s", settings.smtp_host, settings.smtp_port, exc)
         raise EmailDispatchError("network error contacting SMTP server") from exc
 
 
 # --------------------------------------------------------------------------- #
-# Public entry point (called from ping_service.py)
+# Public Dispatch Functions
 # --------------------------------------------------------------------------- #
 
 def send_alert_notification(payload: Dict[str, Any]) -> None:
-    """
-    Called (sync) from the ping diagnostic Celery task once a target has been
-    unreachable for all batches.
+    """Dispatches an alert notification email to the primary ISP contact and logs escalation.
 
-    Given payload = {site_id, alert_id, ping_diagnostic_id, ping_results}:
-      1. Looks up the site's primary ISP assignment -> circuit_id + isp_id.
-      2. Looks up the ISP's active contact emails.
-      3. Renders and sends a single email to the primary ISP contact, CC'ing
-         ONLY the internal support team (address from .env).
-      4. Persists one EscalationRecord row for the email, and updates
-         ALERT_HISTORY.escalation_status accordingly.
-
-    Never raises -- all failures are logged so a bad recipient/template/DB
-    hiccup can't crash the worker or block the Celery task chain.
+    Sync function designed to be invoked from worker tasks or background threads.
     """
     site_id = payload.get("site_id")
     alert_id = payload.get("alert_id")
@@ -205,13 +187,11 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
         return
     if alert_id is None:
         logger.warning(
-            "send_alert_notification called without alert_id for site_id=%s; "
-            "escalation cannot be recorded, aborting.",
+            "send_alert_notification called without alert_id for site_id=%s; escalation cannot be recorded, aborting.",
             site_id,
         )
         return
 
-    # ---  circuit id, isp id, and ISP contact emails -----------------
     try:
         with session_scope(SessionLocal) as session:
             logger.debug("Fetching primary ISP assignment for site_id=%s", site_id)
@@ -236,10 +216,8 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
         logger.exception("Unexpected error looking up ISP details for site_id=%s", site_id)
         return
 
-    # Only extract the primary contact email (first in list)
     isp_recipient = _validated(isp_contacts[0].email_address) if isp_contacts else None
-
-    support_recipient = _validated(SUPPORT_TEAM_EMAIL)
+    support_recipient = _validated(settings.support_team_email)
     if not support_recipient:
         logger.warning("SUPPORT_TEAM_EMAIL is not configured (or invalid) in the environment.")
 
@@ -254,18 +232,15 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
         "max_rtt_ms": ping_results.get("max_rtt_ms"),
     }
 
-    # --- single email to primary ISP contact, CC'ing ONLY support team ---
     if not isp_recipient:
         logger.error(
             "No usable active contact email for isp_id=%s (site_id=%s); escalation email not sent.",
-            isp_id, site_id,
+            isp_id,
+            site_id,
         )
         return
 
-    # Build CC list with only support_recipient (if available)
-    cc_list: List[str] = []
-    if support_recipient:
-        cc_list.append(support_recipient)
+    cc_list: List[str] = [support_recipient] if support_recipient else []
 
     _handle_escalation(
         escalated_to="ISP",
@@ -288,7 +263,7 @@ def _handle_escalation(
     context: Dict[str, Any],
     alert_id: int,
 ) -> None:
-    """Render + send one escalation email, then persist the audit trail."""
+    """Render and send escalation email, then record the audit trail in the DB."""
     logger.debug("Executing escalation handler for alert_id=%s to target '%s'", alert_id, escalated_to)
     try:
         subject = _render_template(subject_template, context).strip()
@@ -296,7 +271,8 @@ def _handle_escalation(
     except EmailDispatchError:
         logger.error(
             "Aborting %s escalation for alert_id=%s: template rendering failed",
-            escalated_to, alert_id,
+            escalated_to,
+            alert_id,
         )
         return
 
@@ -309,17 +285,15 @@ def _handle_escalation(
             body_html=body,
         )
         email_sent = True
-        logger.info(
-            "Sent %s escalation email for alert_id=%s to %s", escalated_to, alert_id, recipient_email
-        )
+        logger.info("Sent %s escalation email for alert_id=%s to %s", escalated_to, alert_id, recipient_email)
     except EmailDispatchError:
         logger.exception(
             "Failed to send %s escalation email for alert_id=%s to %s",
-            escalated_to, alert_id, recipient_email,
+            escalated_to,
+            alert_id,
+            recipient_email,
         )
 
-    # Persist the escalation record + update alert_history regardless of
-    # send success, so a failed send is still auditable via response_notes.
     try:
         logger.debug("Persisting escalation audit log to database for alert_id=%s...", alert_id)
         with session_scope(SessionLocal) as session:
@@ -342,9 +316,7 @@ def _handle_escalation(
                     f"Escalated to {escalated_to}" if email_sent else f"Escalation to {escalated_to} failed"
                 ),
             )
-        logger.info(
-            "Recorded %s escalation (sent=%s) for alert_id=%s", escalated_to, email_sent, alert_id
-        )
+        logger.info("Recorded %s escalation (sent=%s) for alert_id=%s", escalated_to, email_sent, alert_id)
     except NotFoundError:
         logger.error("alert_id=%s not found while recording %s escalation", alert_id, escalated_to)
     except DuplicateError as exc:
@@ -358,10 +330,10 @@ def _handle_escalation(
 
 
 def send_warning_notification(payload: Dict[str, Any]) -> bool:
-    support_email = _validated(SUPPORT_TEAM_EMAIL)
-
+    """Dispatches a warning notification email to internal support team."""
+    support_email = _validated(settings.support_team_email)
     if not support_email:
-        logger.error("SUPPORT_TEAM_EMAIL is not configured.")
+        logger.error("SUPPORT_TEAM_EMAIL is not configured in the environment.")
         return False
 
     try:
@@ -373,15 +345,8 @@ def send_warning_notification(payload: Dict[str, Any]) -> bool:
             "timestamp": payload.get("timestamp") or payload.get("datetime", ""),
         }
 
-        subject = _render_template(
-            "warning_subject.txt",
-            context,
-        ).replace("\r", "").replace("\n", "").strip()
-
-        body = _render_template(
-            "warning_body.html",
-            context,
-        )
+        subject = _render_template("warning_subject.txt", context).replace("\r", "").replace("\n", "").strip()
+        body = _render_template("warning_body.html", context)
 
         _send_email(
             to_addresses=[support_email],
@@ -389,20 +354,18 @@ def send_warning_notification(payload: Dict[str, Any]) -> bool:
             subject=subject,
             body_html=body,
         )
-
         logger.info("Warning email sent successfully to support team.")
         return True
-
-    except (EmailDispatchError, Exception) as exc:
+    except Exception as exc:
         logger.exception("Failed to send warning email: %s", exc)
         return False
 
 
 def send_paused_notification(payload: Dict[str, Any]) -> bool:
-    support_email = _validated(SUPPORT_TEAM_EMAIL)
-
+    """Dispatches a paused notification email to internal support team."""
+    support_email = _validated(settings.support_team_email)
     if not support_email:
-        logger.error("SUPPORT_TEAM_EMAIL is not configured.")
+        logger.error("SUPPORT_TEAM_EMAIL is not configured in the environment.")
         return False
 
     try:
@@ -414,15 +377,8 @@ def send_paused_notification(payload: Dict[str, Any]) -> bool:
             "timestamp": payload.get("timestamp") or payload.get("datetime", ""),
         }
 
-        subject = _render_template(
-            "paused_subject.txt",
-            context,
-        ).replace("\r", "").replace("\n", "").strip()
-
-        body = _render_template(
-            "paused_body.html",
-            context,
-        )
+        subject = _render_template("paused_subject.txt", context).replace("\r", "").replace("\n", "").strip()
+        body = _render_template("paused_body.html", context)
 
         _send_email(
             to_addresses=[support_email],
@@ -430,32 +386,8 @@ def send_paused_notification(payload: Dict[str, Any]) -> bool:
             subject=subject,
             body_html=body,
         )
-
         logger.info("Sensor Paused email sent successfully to support team.")
         return True
-
-    except (EmailDispatchError, Exception) as exc:
+    except Exception as exc:
         logger.exception("Failed to send paused email: %s", exc)
         return False
-
-if __name__ == "__main__":
-    from config.logging_config import setup_logging
-    
-    # Initialize logging if module is run standalone
-    setup_logging()
-    
-    logger.info("Executing email notification module as standalone script...")
-    
-    payload = {
-        "site_id": 2198,
-        "alert_id": 105,
-        "ping_diagnostic_id": 104,
-        "ping_results": {
-            "packet_loss_percent": 100,
-            "min_rtt_ms": None,
-            "avg_rtt_ms": None,
-            "max_rtt_ms": None,
-        },
-    }
-
-    send_alert_notification(payload)

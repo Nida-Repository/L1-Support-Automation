@@ -1,9 +1,15 @@
+"""Database Repository Layer.
+
+Provides typed repositories for all domain models with centralized query building,
+pagination, transaction management, and standard exception translation.
+"""
 from __future__ import annotations
 
 import contextlib
 import datetime
 import logging
-from typing import Any, Generic, Iterable, Optional, Sequence, TypeVar
+from dataclasses import dataclass
+from typing import Any, Callable, Generator, Generic, Iterable, Optional, Sequence, TypeVar
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -12,20 +18,27 @@ from sqlalchemy.orm import Session
 from app.models import (
     AlertHistory,
     AlertState,
+    Attachment,
     Base,
+    EmailClassificationType,
+    EmailDirectionType,
     EscalationRecord,
     Isp,
     IspContactEmail,
+    IspEmailThread,
     LogLevelType,
     LogStatusType,
     PingDiagnostic,
+    ReminderHistory,
+    ReminderStatusType,
+    RootCause,
     Sensor,
     SensorLog,
     Site,
     SiteIspAssignment,
 )
+from utils.json_utils import to_jsonable_python
 
-# 1. Module Logger Definition
 logger = logging.getLogger(__name__)
 
 DEFAULT_PAGE_SIZE = 50
@@ -35,40 +48,45 @@ ModelT = TypeVar("ModelT", bound=Base)
 
 
 # ---------------------------------------------------------------------------
-# Exceptions -- typed, so the API/service layer never has to grep DB error text
+# Exceptions
 # ---------------------------------------------------------------------------
 
 class RepositoryError(Exception):
     """Base class for all repository-layer errors."""
+    pass
 
 
 class NotFoundError(RepositoryError):
-    def __init__(self, model: type, identifier: Any):
-        self.model = model
+    """Raised when an operation targets an entity that does not exist."""
+
+    def __init__(self, model: type | str, identifier: Any):
+        model_name = model.__name__ if hasattr(model, "__name__") else str(model)
+        self.model_name = model_name
         self.identifier = identifier
-        message = f"{model.__name__} with id={identifier!r} not found"
+        message = f"{model_name} with id={identifier!r} not found"
         logger.warning(message)
         super().__init__(message)
 
 
 class DuplicateError(RepositoryError):
-    """Raised when a write violates a UNIQUE / PK constraint."""
+    """Raised when a write operation violates a UNIQUE or PRIMARY KEY constraint."""
+    pass
 
 
 class ConstraintViolationError(RepositoryError):
-    """Raised for CHECK constraint or FK violations that aren't duplicates."""
+    """Raised for CHECK constraint or foreign key violations that are not duplicates."""
+    pass
 
 
 def _reraise_integrity_error(exc: IntegrityError) -> None:
-    """Translate a raw IntegrityError into a typed repository exception."""
+    """Translate raw SQLAlchemy IntegrityError into a typed repository domain exception."""
     orig = str(getattr(exc, "orig", exc)).lower()
+    err_msg = str(getattr(exc, "orig", exc))
     if "unique" in orig or "duplicate key" in orig:
-        err_msg = str(exc.orig) if exc.orig else str(exc)
-        logger.error(f"Duplicate entry constraint violation: {err_msg}")
+        logger.error("Duplicate entry constraint violation: %s", err_msg)
         raise DuplicateError(err_msg) from exc
-    
-    err_msg = str(exc.orig) if exc.orig else str(exc)
-    logger.error(f"Database integrity constraint violation: {err_msg}")
+
+    logger.error("Database integrity constraint violation: %s", err_msg)
     raise ConstraintViolationError(err_msg) from exc
 
 
@@ -76,11 +94,22 @@ def _clamp_page_size(limit: int) -> int:
     return max(1, min(limit, MAX_PAGE_SIZE))
 
 
+@dataclass
+class Page(Generic[ModelT]):
+    """Standard pagination envelope."""
+    items: Sequence[ModelT]
+    total: int
+    limit: int
+    offset: int
+
+    @property
+    def has_more(self) -> bool:
+        return self.offset + len(self.items) < self.total
+
+
 @contextlib.contextmanager
-def session_scope(session_factory):
-    """
-    Context manager for scripts/jobs that manage session lifecycles.
-    """
+def session_scope(session_factory: Callable[[], Session]) -> Generator[Session, None, None]:
+    """Context manager for scripts/jobs that manage independent session lifecycles."""
     session: Session = session_factory()
     try:
         yield session
@@ -88,7 +117,7 @@ def session_scope(session_factory):
         logger.debug("Database transaction committed successfully.")
     except Exception as exc:
         session.rollback()
-        logger.error(f"Transaction failed, changes rolled back: {exc}")
+        logger.error("Transaction failed, changes rolled back: %s", exc)
         raise
     finally:
         session.close()
@@ -96,10 +125,11 @@ def session_scope(session_factory):
 
 
 # ---------------------------------------------------------------------------
-# Generic base repository
+# Generic Base Repository
 # ---------------------------------------------------------------------------
 
 class BaseRepository(Generic[ModelT]):
+    """Generic repository providing standard CRUD operations."""
 
     model: type[ModelT]
 
@@ -119,8 +149,8 @@ class BaseRepository(Generic[ModelT]):
         logger.info("Created %s: %s", self.model.__name__, obj)
         return obj
 
-    def bulk_create(self, rows: Iterable[dict]) -> list[ModelT]:
-        """Efficient multi-row insert for high-volume tables (logs, alerts)."""
+    def bulk_create(self, rows: Iterable[dict[str, Any]]) -> list[ModelT]:
+        """Efficient multi-row insert for high-volume entities."""
         objs = [self.model(**row) for row in rows]
         self.session.add_all(objs)
         try:
@@ -131,10 +161,9 @@ class BaseRepository(Generic[ModelT]):
         logger.info("Bulk created %d records for %s", len(objs), self.model.__name__)
         return objs
 
-    # -- Read -------------------------------------------------------------
+    # -- Read -----------------------------------------------------------
 
     def get(self, pk: Any) -> Optional[ModelT]:
-        """PK lookup via the identity map -- no SQL if already loaded."""
         logger.debug("Fetching %s by PK: %s", self.model.__name__, pk)
         return self.session.get(self.model, pk)
 
@@ -154,23 +183,28 @@ class BaseRepository(Generic[ModelT]):
     ) -> Sequence[ModelT]:
         stmt = select(self.model)
         for field, value in filters.items():
-            stmt = stmt.where(getattr(self.model, field) == value)
+            if hasattr(self.model, field):
+                stmt = stmt.where(getattr(self.model, field) == value)
         if order_by is not None:
             stmt = stmt.order_by(order_by)
-        
+
         clamped_limit = _clamp_page_size(limit)
         stmt = stmt.offset(offset).limit(clamped_limit)
-        
+
         logger.debug(
             "Listing %s (filters=%s, offset=%d, limit=%d)",
-            self.model.__name__, filters, offset, clamped_limit
+            self.model.__name__,
+            filters,
+            offset,
+            clamped_limit,
         )
         return self.session.execute(stmt).scalars().all()
 
     def count(self, **filters: Any) -> int:
         stmt = select(func.count()).select_from(self.model)
         for field, value in filters.items():
-            stmt = stmt.where(getattr(self.model, field) == value)
+            if hasattr(self.model, field):
+                stmt = stmt.where(getattr(self.model, field) == value)
         total = self.session.execute(stmt).scalar_one()
         logger.debug("Count for %s matching %s: %d", self.model.__name__, filters, total)
         return total
@@ -178,31 +212,32 @@ class BaseRepository(Generic[ModelT]):
     def exists(self, **filters: Any) -> bool:
         return self.count(**filters) > 0
 
-    # -- Update -------------------------------------------------------------
+    # -- Update ---------------------------------------------------------
 
     def update(self, pk: Any, **fields: Any) -> ModelT:
         obj = self.get_or_404(pk)
         for key, value in fields.items():
-            setattr(obj, key, value)
+            if hasattr(obj, key):
+                setattr(obj, key, value)
         try:
             self.session.flush()
         except IntegrityError as exc:
             self.session.rollback()
             _reraise_integrity_error(exc)
-        logger.info("Updated %s(pk=%s) with fields: %s", self.model.__name__, pk, list(fields.keys()))
+        logger.info("Updated %s(pk=%s) fields: %s", self.model.__name__, pk, list(fields.keys()))
         return obj
 
-    def bulk_update(self, filters: dict, values: dict) -> int:
-        """Set-based UPDATE ... WHERE, no ORM objects loaded. Returns row count."""
+    def bulk_update(self, filters: dict[str, Any], values: dict[str, Any]) -> int:
         stmt = update(self.model).values(**values)
         for field, value in filters.items():
-            stmt = stmt.where(getattr(self.model, field) == value)
+            if hasattr(self.model, field):
+                stmt = stmt.where(getattr(self.model, field) == value)
         stmt = stmt.execution_options(synchronize_session="fetch")
         result = self.session.execute(stmt)
         logger.info("Bulk updated %d rows in %s matching %s", result.rowcount, self.model.__name__, filters)
         return result.rowcount
 
-    # -- Delete -------------------------------------------------------------
+    # -- Delete ---------------------------------------------------------
 
     def delete(self, pk: Any) -> None:
         obj = self.get_or_404(pk)
@@ -217,7 +252,8 @@ class BaseRepository(Generic[ModelT]):
     def bulk_delete(self, **filters: Any) -> int:
         stmt = delete(self.model)
         for field, value in filters.items():
-            stmt = stmt.where(getattr(self.model, field) == value)
+            if hasattr(self.model, field):
+                stmt = stmt.where(getattr(self.model, field) == value)
         stmt = stmt.execution_options(synchronize_session="fetch")
         result = self.session.execute(stmt)
         logger.info("Bulk deleted %d rows from %s", result.rowcount, self.model.__name__)
@@ -225,7 +261,7 @@ class BaseRepository(Generic[ModelT]):
 
 
 # ---------------------------------------------------------------------------
-# Domain repositories
+# Domain Repositories
 # ---------------------------------------------------------------------------
 
 class SiteRepository(BaseRepository[Site]):
@@ -291,6 +327,16 @@ class SiteIspAssignmentRepository(BaseRepository[SiteIspAssignment]):
 class SensorRepository(BaseRepository[Sensor]):
     model = Sensor
 
+    def create(self, **fields: Any) -> Sensor:
+        if "warning_threshold" in fields and fields["warning_threshold"] is not None:
+            fields["warning_threshold"] = to_jsonable_python(fields["warning_threshold"])
+        return super().create(**fields)
+
+    def update(self, pk: Any, **fields: Any) -> Sensor:
+        if "warning_threshold" in fields and fields["warning_threshold"] is not None:
+            fields["warning_threshold"] = to_jsonable_python(fields["warning_threshold"])
+        return super().update(pk, **fields)
+
     def list_for_assignment(self, assignment_id: int) -> Sequence[Sensor]:
         logger.debug("Listing sensors for assignment_id: %d", assignment_id)
         stmt = select(Sensor).where(Sensor.site_isp_assignment_id == assignment_id)
@@ -340,17 +386,35 @@ class AlertHistoryRepository(BaseRepository[AlertHistory]):
         )
         return self.session.execute(stmt).scalars().all()
 
-    def resolve(self, alert_id: int, *, resolved_at: Optional[datetime.datetime] = None) -> AlertHistory:
+    def resolve(
+        self, alert_id: int, *, resolved_at: Optional[datetime.datetime] = None
+    ) -> AlertHistory:
         timestamp = resolved_at or datetime.datetime.now(datetime.timezone.utc)
         logger.info("Resolving alert_id: %d at %s", alert_id, timestamp)
-        return self.update(
-            alert_id,
-            resolved_at=timestamp,
-        )
+        return self.update(alert_id, resolved_at=timestamp)
 
 
 class SensorLogRepository(BaseRepository[SensorLog]):
     model = SensorLog
+
+    def create(self, **fields: Any) -> SensorLog:
+        if "log_details" in fields and fields["log_details"] is not None:
+            fields["log_details"] = to_jsonable_python(fields["log_details"])
+        return super().create(**fields)
+
+    def bulk_create(self, rows: Iterable[dict[str, Any]]) -> list[SensorLog]:
+        sanitized_rows = []
+        for r in rows:
+            row_dict = dict(r)
+            if "log_details" in row_dict and row_dict["log_details"] is not None:
+                row_dict["log_details"] = to_jsonable_python(row_dict["log_details"])
+            sanitized_rows.append(row_dict)
+        return super().bulk_create(sanitized_rows)
+
+    def update(self, pk: Any, **fields: Any) -> SensorLog:
+        if "log_details" in fields and fields["log_details"] is not None:
+            fields["log_details"] = to_jsonable_python(fields["log_details"])
+        return super().update(pk, **fields)
 
     def list_for_sensor(
         self,
@@ -361,7 +425,9 @@ class SensorLogRepository(BaseRepository[SensorLog]):
         limit: int = DEFAULT_PAGE_SIZE,
         offset: int = 0,
     ) -> Sequence[SensorLog]:
-        logger.debug("Fetching logs for sensor_id: %d (level=%s, status=%s)", sensor_id, level, status)
+        logger.debug(
+            "Fetching logs for sensor_id: %d (level=%s, status=%s)", sensor_id, level, status
+        )
         stmt = select(SensorLog).where(SensorLog.sensor_id == sensor_id)
         if level is not None:
             stmt = stmt.where(SensorLog.log_level == level)
@@ -407,32 +473,181 @@ class EscalationRecordRepository(BaseRepository[EscalationRecord]):
         )
         return self.session.execute(stmt).scalars().all()
 
-    def mark_response_received(self, escalation_id: int, *, notes: Optional[str] = None) -> EscalationRecord:
+    def mark_response_received(
+        self, escalation_id: int, *, notes: Optional[str] = None
+    ) -> EscalationRecord:
         logger.info("Marking response received for escalation_id: %d", escalation_id)
         return self.update(escalation_id, response_received=True, response_notes=notes)
 
 
-# ---------------------------------------------------------------------------
-# Example usage (not executed on import)
-# ---------------------------------------------------------------------------
+class IspEmailThreadRepository(BaseRepository[IspEmailThread]):
+    model = IspEmailThread
 
-if __name__ == "__main__":
-    from app.database import SessionLocal 
-    from config.logging_config import setup_logging
-    
-    # Run central logging setup if executed directly
-    setup_logging()
+    def get_by_message_id(self, message_id: str) -> Optional[IspEmailThread]:
+        stmt = select(IspEmailThread).where(IspEmailThread.message_id == message_id)
+        return self.session.execute(stmt).scalar_one_or_none()
 
-    logger.info("Executing repository script module...")
+    def get_reply_chain(self, in_reply_to: str) -> Sequence[IspEmailThread]:
+        stmt = (
+            select(IspEmailThread)
+            .where(IspEmailThread.in_reply_to == in_reply_to)
+            .order_by(IspEmailThread.sent_received_at.asc())
+        )
+        return self.session.execute(stmt).scalars().all()
 
-    with session_scope(SessionLocal) as session:
-        sites = SiteRepository(session)
-        alerts = AlertHistoryRepository(session)
+    def list_for_alert(
+        self,
+        alert_id: int,
+        *,
+        direction: Optional[EmailDirectionType] = None,
+        classification_type: Optional[EmailClassificationType] = None,
+        limit: int = DEFAULT_PAGE_SIZE,
+        offset: int = 0,
+    ) -> Page[IspEmailThread]:
+        stmt = select(IspEmailThread).where(IspEmailThread.alert_id == alert_id)
+        if direction is not None:
+            stmt = stmt.where(IspEmailThread.direction == direction)
+        if classification_type is not None:
+            stmt = stmt.where(IspEmailThread.classification_type == classification_type)
 
-        site = sites.get_by_name("Budapest")
-        logger.info("Site query result: %s", site)
-        
-        if site is not None:
-            open_alerts = alerts.list_unresolved(limit=20)
-            for alert in open_alerts:
-                logger.info("Open alert record: %s", alert)
+        total = self.session.execute(
+            select(func.count()).select_from(stmt.subquery())
+        ).scalar_one()
+
+        clamped_limit = _clamp_page_size(limit)
+        stmt = (
+            stmt.order_by(IspEmailThread.sent_received_at.desc())
+            .limit(clamped_limit)
+            .offset(offset)
+        )
+        items = self.session.execute(stmt).scalars().all()
+        return Page(items=items, total=total, limit=clamped_limit, offset=offset)
+
+
+class ReminderHistoryRepository(BaseRepository[ReminderHistory]):
+    model = ReminderHistory
+
+    def list_for_alert(
+        self, alert_id: int, *, limit: int = DEFAULT_PAGE_SIZE, offset: int = 0
+    ) -> Page[ReminderHistory]:
+        stmt = select(ReminderHistory).where(ReminderHistory.alert_id == alert_id)
+        total = self.session.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
+
+        clamped_limit = _clamp_page_size(limit)
+        stmt = (
+            stmt.order_by(ReminderHistory.reminder_number.asc())
+            .limit(clamped_limit)
+            .offset(offset)
+        )
+        items = self.session.execute(stmt).scalars().all()
+        return Page(items=items, total=total, limit=clamped_limit, offset=offset)
+
+    def list_pending(
+        self,
+        *,
+        status: ReminderStatusType = ReminderStatusType.SENT,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Page[ReminderHistory]:
+        stmt = select(ReminderHistory).where(
+            ReminderHistory.status == status,
+            ReminderHistory.response_received.is_(False),
+        )
+        total = self.session.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
+
+        clamped_limit = _clamp_page_size(limit)
+        stmt = (
+            stmt.order_by(ReminderHistory.sent_at.asc())
+            .limit(clamped_limit)
+            .offset(offset)
+        )
+        items = self.session.execute(stmt).scalars().all()
+        return Page(items=items, total=total, limit=clamped_limit, offset=offset)
+
+    def mark_responded(
+        self,
+        reminder_id: int,
+        *,
+        response_received_at: Optional[datetime.datetime] = None,
+    ) -> ReminderHistory:
+        timestamp = response_received_at or datetime.datetime.now(datetime.timezone.utc)
+        return self.update(
+            reminder_id,
+            response_received=True,
+            response_received_at=timestamp,
+        )
+
+
+class RootCauseRepository(BaseRepository[RootCause]):
+    model = RootCause
+
+    def get_by_alert(self, alert_id: int) -> Optional[RootCause]:
+        stmt = select(RootCause).where(RootCause.alert_id == alert_id)
+        return self.session.execute(stmt).scalar_one_or_none()
+
+    def upsert_for_alert(
+        self,
+        *,
+        alert_id: int,
+        root_cause_name: str,
+        category: str,
+        identified_by: str,
+        description: Optional[str] = None,
+        customer_confirmed: bool = False,
+        total_downtime: Optional[datetime.timedelta] = None,
+    ) -> RootCause:
+        existing = self.get_by_alert(alert_id)
+        if existing is None:
+            return self.create(
+                alert_id=alert_id,
+                root_cause_name=root_cause_name,
+                category=category,
+                identified_by=identified_by,
+                description=description,
+                customer_confirmed=customer_confirmed,
+                total_downtime=total_downtime,
+            )
+
+        return self.update(
+            existing.root_cause_id,
+            root_cause_name=root_cause_name,
+            category=category,
+            identified_by=identified_by,
+            description=description,
+            customer_confirmed=customer_confirmed,
+            total_downtime=total_downtime,
+        )
+
+    def confirm(self, root_cause_id: int) -> RootCause:
+        return self.update(root_cause_id, customer_confirmed=True)
+
+
+class AttachmentRepository(BaseRepository[Attachment]):
+    model = Attachment
+
+    def get_by_object_key(self, object_key: str) -> Optional[Attachment]:
+        stmt = select(Attachment).where(Attachment.object_key == object_key)
+        return self.session.execute(stmt).scalar_one_or_none()
+
+    def list_for_alert(
+        self, alert_id: int, *, limit: int = DEFAULT_PAGE_SIZE, offset: int = 0
+    ) -> Page[Attachment]:
+        stmt = select(Attachment).where(Attachment.alert_id == alert_id)
+        total = self.session.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
+
+        clamped_limit = _clamp_page_size(limit)
+        stmt = (
+            stmt.order_by(Attachment.uploaded_at.desc())
+            .limit(clamped_limit)
+            .offset(offset)
+        )
+        items = self.session.execute(stmt).scalars().all()
+        return Page(items=items, total=total, limit=clamped_limit, offset=offset)
+
+    def list_for_thread(self, thread_id: int) -> Sequence[Attachment]:
+        stmt = (
+            select(Attachment)
+            .where(Attachment.thread_id == thread_id)
+            .order_by(Attachment.uploaded_at.asc())
+        )
+        return self.session.execute(stmt).scalars().all()

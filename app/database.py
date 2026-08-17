@@ -1,58 +1,56 @@
+"""Database Engine, Session Management, and Declarative Base.
+
+Manages PostgreSQL connection pooling via SQLAlchemy 2.0 and provides
+thread-safe session scopes and FastAPI dependency generators.
+"""
+from __future__ import annotations
+
 import logging
-import os
-from urllib.parse import urlparse
+from typing import Generator
 
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy import create_engine
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-# 1. Instantiate module-level logger
+from config.settings import settings
+
+from utils.json_utils import json_dumps, json_loads
+
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+logger.info("Initializing database connection engine: %s", settings.safe_database_url)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Configure psycopg3 JSON/JSONB dumpers to seamlessly serialize Decimal, datetime, UUID, IP addresses, etc.
+try:
+    import psycopg.types.json
 
-if not DATABASE_URL:
-    logger.critical("DATABASE_URL environment variable is missing!")
-    raise ValueError("DATABASE_URL is not set in the environment.")
-
-
-def _safe_db_url(url: str) -> str:
-    """Helper to scrub passwords from the connection URL for safe log output."""
-    try:
-        parsed = urlparse(url)
-        if parsed.password:
-            return url.replace(parsed.password, "******")
-        return url
-    except Exception:
-        return "DATABASE_URL [masked]"
-
-
-logger.info("Initializing database connection engine: %s", _safe_db_url(DATABASE_URL))
+    psycopg.types.json.set_json_dumps(json_dumps)
+    logger.debug("Successfully configured psycopg JSON/JSONB dumper with custom json_dumps.")
+except (ImportError, AttributeError) as exc:
+    logger.warning("Could not register psycopg custom JSON dumper: %s", exc)
 
 
 class Base(DeclarativeBase):
-    """
-    Shared SQLAlchemy declarative base.
-    All ORM models inherit from this class.
-    """
+    """Shared SQLAlchemy declarative base for all ORM models."""
     pass
 
 
 engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
+    settings.database_url,
+    pool_pre_ping=settings.db_pool_pre_ping,
     future=True,
-    pool_size=10,
-    max_overflow=20,
-    pool_recycle=1800,
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
+    pool_recycle=settings.db_pool_recycle,
+    json_serializer=json_dumps,
+    json_deserializer=json_loads,
 )
 
 logger.info(
-    "Database engine created successfully (pool_size=10, max_overflow=20, pool_recycle=1800s)."
+    "Database engine initialized (pool_size=%d, max_overflow=%d, pool_recycle=%ds).",
+    settings.db_pool_size,
+    settings.db_max_overflow,
+    settings.db_pool_recycle,
 )
-
 
 SessionLocal = sessionmaker(
     bind=engine,
@@ -62,12 +60,12 @@ SessionLocal = sessionmaker(
 )
 
 
-def get_db():
+def get_db() -> Generator[Session, None, None]:
+    """FastAPI dependency-style database session generator.
+
+    Yields an active database session and handles closing and error logging cleanly.
     """
-    FastAPI dependency style database session generator.
-    Yields a session and handles closing/errors cleanly.
-    """
-    db = SessionLocal()
+    db: Session = SessionLocal()
     logger.debug("Database session opened [ID: %s]", id(db))
     try:
         yield db

@@ -1,49 +1,39 @@
-import logging
-import os
-from urllib.parse import urlparse
+"""Celery Application Initialization and Topology.
 
+Configures RabbitMQ message broker, Redis result backend, exchange bindings,
+and Dead Letter Queue (DLQ) topology.
+"""
+from __future__ import annotations
+
+import logging
 from celery import Celery
 from celery.signals import after_setup_logger, worker_init
-from dotenv import load_dotenv
 from kombu import Exchange, Queue
 
-from config.logging_config import setup_logging, LOGGING_CONFIG
+from config.logging_config import LOGGING_CONFIG, setup_logging
+from config.settings import settings
+from utils.json_utils import json_dumps, json_loads
+import kombu.serialization
+
 setup_logging()
-# 1. Instantiate module-level logger
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+# Register robust custom json serializer for Kombu/Celery supporting Decimal, datetime, etc.
+kombu.serialization.register(
+    "json",
+    json_dumps,
+    json_loads,
+    content_type="application/json",
+    content_encoding="utf-8",
+)
 
-RABBITMQ_URL = os.getenv("RABBITMQ_URL")
-REDIS_URL = os.getenv("REDIS_URL")
-
-
-def _safe_url(url: str) -> str:
-    """Helper to scrub passwords from connection URLs before logging."""
-    try:
-        parsed = urlparse(url)
-        if parsed.password:
-            return url.replace(parsed.password, "******")
-        return url
-    except Exception:
-        return "[masked_url]"
-
-
-if not RABBITMQ_URL:
-    logger.critical("RABBITMQ_URL environment variable is missing!")
-    raise RuntimeError("RABBITMQ_URL environment variable is not set")
-
-if not REDIS_URL:
-    logger.critical("REDIS_URL environment variable is missing!")
-    raise RuntimeError("REDIS_URL environment variable is not set")
-
-logger.info("Initializing Celery app with Broker: %s", _safe_url(RABBITMQ_URL))
-logger.info("Setting up Celery Result Backend: %s", _safe_url(REDIS_URL))
+logger.info("Initializing Celery app with Broker: %s", settings.safe_rabbitmq_url)
+logger.info("Setting up Celery Result Backend: %s", settings.safe_redis_url)
 
 celery_app = Celery(
     "prtg_tasks",
-    broker=RABBITMQ_URL,
-    backend=REDIS_URL,
+    broker=settings.rabbitmq_url,
+    backend=settings.redis_url,
     include=["task_queue.tasks"],
 )
 
@@ -57,24 +47,19 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     result_expires=3600,
-
-     # --- Logging ---
-    worker_hijack_root_logger=False,   # <-- stop Celery from wiping your handlers
-
-
-    # --- Delivery / reliability ---
-    task_acks_late=True,                     # ack only after task completes
-    task_reject_on_worker_lost=True,         # requeue if worker dies mid-task
-    task_acks_on_failure_or_timeout=False,   # do NOT ack on raised exception
-    broker_connection_retry_on_startup=True, 
-    broker_connection_max_retries=None,      
-
-    # --- Worker behavior ---
-    worker_prefetch_multiplier=1,            # don't hoard messages ahead of DLQ retries
-    task_time_limit=120,                     # hard kill runaway tasks (seconds)
-    task_soft_time_limit=90,
-
-    # --- Queues / DLQ topology ---
+    # --- Logging ---
+    worker_hijack_root_logger=False,
+    # --- Delivery / Reliability ---
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    task_acks_on_failure_or_timeout=False,
+    broker_connection_retry_on_startup=True,
+    broker_connection_max_retries=None,
+    # --- Worker Behavior ---
+    worker_prefetch_multiplier=1,
+    task_time_limit=settings.celery_task_time_limit,
+    task_soft_time_limit=settings.celery_task_soft_time_limit,
+    # --- Queues / DLQ Topology ---
     task_queues=(
         Queue(
             "prtg_webhook_queue",
@@ -101,10 +86,8 @@ logger.info("Celery queues and exchanges configured successfully.")
 
 @after_setup_logger.connect
 def setup_celery_logging(logger, format, loglevel, plaintext, **kwargs):
-    """
-    Re-apply dictConfig after Celery's own logger setup runs, as a safety net.
-    With worker_hijack_root_logger=False.
-    """
+    """Re-apply logging configuration after Celery's own logger setup runs."""
+    import logging.config
     logging.config.dictConfig(LOGGING_CONFIG)
     logger.info("Custom dictConfig successfully applied to Celery loggers.")
 

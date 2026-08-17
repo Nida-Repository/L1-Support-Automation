@@ -1,0 +1,53 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "FastAPI Webhook Gateway",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "uvicorn",
+            "args": [
+                "api.webhook:app",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8000",
+                "--reload"
+            ],
+            "jinja": true,
+            "justMyCode": false,
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Celery Task Worker",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "celery",
+            "args": [
+                "-A",
+                "task_queue.celery_app",
+                "worker",
+                "-l",
+                "INFO",
+                "-P",
+                "solo"
+            ],
+            "justMyCode": false,
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "IMAP Inbox Monitor Daemon",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/inbox_monitor.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Run Database Check Script",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/test/db_check.py",
+            "console": "integratedTerminal"
+        }
+    ]
+}

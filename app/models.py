@@ -1,3 +1,8 @@
+"""SQLAlchemy Declarative ORM Models.
+
+Defines all database entities, PostgreSQL enum types, constraints, indexes,
+and static relationship mappings for the L1 Support Automation system.
+"""
 from __future__ import annotations
 
 import datetime
@@ -14,6 +19,7 @@ from sqlalchemy import (
     Identity,
     Index,
     Integer,
+    Interval,
     Numeric,
     String,
     Text,
@@ -51,9 +57,30 @@ class LogLevelType(str, enum.Enum):
     CRITICAL = "CRITICAL"
 
 
-# Native Postgres ENUM type objects. `create_type=True` (default) means the
-# first column that uses each one will emit CREATE TYPE; subsequent columns
-# reference the same Python object so SQLAlchemy will not try to redefine it.
+class EmailClassificationType(str, enum.Enum):
+    LINK_STABLE = "Link Stable"
+    MAINTENANCE = "Maintenance"
+    NEED_PING = "Need Ping"
+    NEED_TRACEROUTE = "Need Traceroute"
+    TECHNICAL_ISSUE = "Technical Issue"
+    NO_ISP_ISSUE = "No ISP Issue"
+    POWER_ISSUE = "Power Issue"
+    UNKNOWN = "Unknown"
+
+
+class EmailDirectionType(str, enum.Enum):
+    INCOMING = "Incoming"
+    OUTGOING = "Outgoing"
+
+
+class ReminderStatusType(str, enum.Enum):
+    SENT = "Sent"
+    FAILED = "Failed"
+    DELIVERED = "Delivered"
+    BOUNCED = "Bounced"
+
+
+# Native PostgreSQL ENUM types
 isp_email_role_enum = PGEnum(
     IspEmailRole, name="isp_email_role", values_callable=lambda e: [m.value for m in e]
 )
@@ -63,10 +90,25 @@ log_status_type_enum = PGEnum(
 log_level_type_enum = PGEnum(
     LogLevelType, name="log_level_type", values_callable=lambda e: [m.value for m in e]
 )
+email_classification_enum = PGEnum(
+    EmailClassificationType,
+    name="email_classification_type",
+    values_callable=lambda obj: [e.value for e in obj],
+)
+email_direction_enum = PGEnum(
+    EmailDirectionType,
+    name="email_direction_type",
+    values_callable=lambda obj: [e.value for e in obj],
+)
+reminder_status_enum = PGEnum(
+    ReminderStatusType,
+    name="reminder_status_type",
+    values_callable=lambda obj: [e.value for e in obj],
+)
 
 
 # ---------------------------------------------------------------------------
-# 2. Base tables
+# 2. Topology & Base Tables
 # ---------------------------------------------------------------------------
 
 class Site(Base):
@@ -134,6 +176,7 @@ class IspContactEmail(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
 
     isp: Mapped["Isp"] = relationship(back_populates="contact_emails")
+    reminders: Mapped[list["ReminderHistory"]] = relationship(back_populates="email")
 
     __table_args__ = (
         CheckConstraint("email_id BETWEEN 1000 AND 9999", name="chk_email_id_4_digit"),
@@ -235,7 +278,7 @@ class AlertState(Base):
 
 
 # ---------------------------------------------------------------------------
-# 3. High-volume log & history tables
+# 3. High-Volume Log & Alert History Tables
 # ---------------------------------------------------------------------------
 
 class AlertHistory(Base):
@@ -263,6 +306,18 @@ class AlertHistory(Base):
         back_populates="alert", cascade="all, delete-orphan", passive_deletes=True
     )
     escalation_records: Mapped[list["EscalationRecord"]] = relationship(
+        back_populates="alert", cascade="all, delete-orphan", passive_deletes=True
+    )
+    email_threads: Mapped[list["IspEmailThread"]] = relationship(
+        back_populates="alert", cascade="all, delete-orphan", passive_deletes=True
+    )
+    reminders: Mapped[list["ReminderHistory"]] = relationship(
+        back_populates="alert", cascade="all, delete-orphan", passive_deletes=True
+    )
+    root_cause: Mapped[Optional["RootCause"]] = relationship(
+        back_populates="alert", cascade="all, delete-orphan", passive_deletes=True, uselist=False
+    )
+    attachments: Mapped[list["Attachment"]] = relationship(
         back_populates="alert", cascade="all, delete-orphan", passive_deletes=True
     )
 
@@ -337,17 +392,9 @@ class PingDiagnostic(Base):
         CheckConstraint(
             "packet_loss_percent BETWEEN 0.00 AND 100.00", name="chk_packet_loss"
         ),
-        CheckConstraint(
-            "min_rtt_ms >= 0", name="ping_diagnostics_min_rtt_ms_check"
-        ),
-        CheckConstraint(
-            "avg_rtt_ms >= 0", name="ping_diagnostics_avg_rtt_ms_check"
-        ),
-        CheckConstraint(
-            "max_rtt_ms >= 0", name="ping_diagnostics_max_rtt_ms_check"
-        ),
-        # Covering index: INCLUDE columns are not part of the key, only stored
-        # in the index for index-only scans.
+        CheckConstraint("min_rtt_ms >= 0", name="ping_diagnostics_min_rtt_ms_check"),
+        CheckConstraint("avg_rtt_ms >= 0", name="ping_diagnostics_avg_rtt_ms_check"),
+        CheckConstraint("max_rtt_ms >= 0", name="ping_diagnostics_max_rtt_ms_check"),
         Index(
             "idx_ping_diagnostics_alert_covered",
             "alert_id",
@@ -390,3 +437,180 @@ class EscalationRecord(Base):
 
     def __repr__(self) -> str:
         return f"<EscalationRecord {self.escalation_id} alert={self.alert_id}>"
+
+
+# ---------------------------------------------------------------------------
+# 4. Email Threads, Reminders, Root Cause & Attachments
+# ---------------------------------------------------------------------------
+
+class IspEmailThread(Base):
+    __tablename__ = "isp_email_threads"
+
+    thread_id: Mapped[int] = mapped_column(
+        Identity(start=100, always=True), primary_key=True
+    )
+    alert_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("alert_history.alert_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    message_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    in_reply_to: Mapped[Optional[str]] = mapped_column(String(255))
+    email_references: Mapped[Optional[list[str]]] = mapped_column(ARRAY(Text))
+    subject: Mapped[Optional[str]] = mapped_column(Text)
+    sender: Mapped[str] = mapped_column(String(255), nullable=False)
+    receiver: Mapped[str] = mapped_column(String(255), nullable=False)
+    cc: Mapped[Optional[list[str]]] = mapped_column(ARRAY(Text))
+    direction: Mapped[EmailDirectionType] = mapped_column(
+        email_direction_enum, nullable=False
+    )
+    sent_received_at: Mapped[datetime.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+    body: Mapped[Optional[str]] = mapped_column(Text)
+    classification_type: Mapped[EmailClassificationType] = mapped_column(
+        email_classification_enum,
+        nullable=False,
+        server_default=EmailClassificationType.UNKNOWN.value,
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+    alert: Mapped["AlertHistory"] = relationship(back_populates="email_threads")
+    attachments: Mapped[list["Attachment"]] = relationship(
+        back_populates="thread", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+    __table_args__ = (
+        Index("idx_isp_email_threads_alert", "alert_id"),
+        Index(
+            "idx_isp_email_threads_reply",
+            "in_reply_to",
+            postgresql_where=(in_reply_to.isnot(None)),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<IspEmailThread id={self.thread_id} alert_id={self.alert_id} "
+            f"direction={self.direction!r} subject={self.subject!r}>"
+        )
+
+
+class ReminderHistory(Base):
+    __tablename__ = "reminder_history"
+
+    reminder_id: Mapped[int] = mapped_column(
+        Identity(start=100, always=True), primary_key=True
+    )
+    alert_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("alert_history.alert_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    reminder_number: Mapped[int] = mapped_column(nullable=False)
+    sent_at: Mapped[datetime.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+    email_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("isp_contact_emails.email_id", ondelete="SET NULL")
+    )
+    response_received: Mapped[bool] = mapped_column(nullable=False, server_default="false")
+    response_received_at: Mapped[Optional[datetime.datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    status: Mapped[ReminderStatusType] = mapped_column(
+        reminder_status_enum,
+        nullable=False,
+        server_default=ReminderStatusType.SENT.value,
+    )
+
+    alert: Mapped["AlertHistory"] = relationship(back_populates="reminders")
+    email: Mapped[Optional["IspContactEmail"]] = relationship(back_populates="reminders")
+
+    __table_args__ = (
+        CheckConstraint("reminder_number > 0", name="reminder_history_reminder_number_check"),
+        CheckConstraint(
+            "response_received_at IS NULL OR response_received_at >= sent_at",
+            name="chk_response_time",
+        ),
+        Index("idx_reminder_history_alert", "alert_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ReminderHistory id={self.reminder_id} alert_id={self.alert_id} "
+            f"number={self.reminder_number} status={self.status!r}>"
+        )
+
+
+class RootCause(Base):
+    __tablename__ = "root_cause"
+
+    root_cause_id: Mapped[int] = mapped_column(
+        Identity(start=100, always=True), primary_key=True
+    )
+    alert_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("alert_history.alert_id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+    )
+    root_cause_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    category: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    identified_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    identified_at: Mapped[datetime.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+    customer_confirmed: Mapped[bool] = mapped_column(nullable=False, server_default="false")
+    total_downtime: Mapped[Optional[datetime.timedelta]] = mapped_column(Interval)
+
+    alert: Mapped["AlertHistory"] = relationship(back_populates="root_cause")
+
+    def __repr__(self) -> str:
+        return f"<RootCause id={self.root_cause_id} alert_id={self.alert_id} name={self.root_cause_name!r}>"
+
+
+class Attachment(Base):
+    __tablename__ = "attachments"
+
+    attachment_id: Mapped[int] = mapped_column(
+        Identity(start=100, always=True), primary_key=True
+    )
+    alert_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("alert_history.alert_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    thread_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("isp_email_threads.thread_id", ondelete="CASCADE")
+    )
+    file_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    file_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    bucket_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(500), nullable=False, unique=True)
+    etag: Mapped[Optional[str]] = mapped_column(String(100))
+    uploaded_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    uploaded_at: Mapped[datetime.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.current_timestamp()
+    )
+
+    alert: Mapped["AlertHistory"] = relationship(back_populates="attachments")
+    thread: Mapped[Optional["IspEmailThread"]] = relationship(back_populates="attachments")
+
+    __table_args__ = (
+        CheckConstraint("file_size > 0", name="attachments_file_size_check"),
+        Index("idx_attachments_alert", "alert_id"),
+        Index(
+            "idx_attachments_thread",
+            "thread_id",
+            postgresql_where=(thread_id.isnot(None)),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Attachment id={self.attachment_id} file_name={self.file_name!r} object_key={self.object_key!r}>"

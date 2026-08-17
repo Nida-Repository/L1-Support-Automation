@@ -1,0 +1,43 @@
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: l1_minio_server
+    restart: always
+    env_file:
+      - ../.env
+    ports:
+      - "9000:9000" # S3 API endpoint
+      - "9001:9001" # Web Console UI
+    volumes:
+      - minio_data:/data
+    command: server --console-address ":9001" /data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # Automated bucket initialization worker
+  minio-init:
+    image: quay.io/minio/mc:latest
+    container_name: l1_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    env_file:
+      - ../.env
+    entrypoint: |-
+      /bin/sh -c "
+      until mc alias set myminio http://minio:9000 \$$MINIO_ROOT_USER \$$MINIO_ROOT_PASSWORD; do
+        echo 'Waiting for MinIO service connection...'
+        sleep 2
+      done
+      mc mb myminio/\$$AUTOMATION_BUCKET --ignore-existing
+      echo 'MinIO initialization finished successfully!'
+      exit 0
+      "
+
+volumes:
+  minio_data:
+    driver: local

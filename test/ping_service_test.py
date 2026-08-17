@@ -86,7 +86,7 @@ async def test_execute_recovers_early(
         await service.execute(payload)
 
     # Should exit loop early at batch 2
-    mock_recovered.assert_called_once_with(10)
+    mock_recovered.assert_called_once_with(10, "10.0.0.1")
     mock_unreachable.assert_not_called()
     assert mock_sleep.call_count == 1  # Paused only once between batch 1 & 2
 
@@ -129,14 +129,12 @@ def test_on_site_recovered(mock_session_scope):
     mock_session = MagicMock()
     mock_session_scope.return_value.__enter__.return_value = mock_session
 
-    with patch(
-        "services.ping_service.SensorLogRepository"
-    ) as mock_repo_cls:
+    with patch("services.ping_service.SensorLogRepository") as mock_repo_cls:
         mock_repo = mock_repo_cls.return_value
         mock_repo.close_open_logs.return_value = 2
 
         service = PingIp()
-        service._on_site_recovered(sensor_id=10)
+        service._on_site_recovered(sensor_id=10, target_ip="10.0.0.1")
 
         mock_repo_cls.assert_called_once_with(mock_session)
         mock_repo.close_open_logs.assert_called_once_with(10)
@@ -156,15 +154,10 @@ async def test_on_site_unreachable_with_alert_id(mock_session_scope):
         "max_rtt_ms": None,
     }
 
-    # Dynamic mock module import for client.smtp_client
     mock_smtp = AsyncMock()
-    sys.modules["client.smtp_client"] = MagicMock(
-        send_alert_notification=mock_smtp
-    )
 
-    with patch(
-        "services.ping_service.PingDiagnosticRepository"
-    ) as mock_repo_cls:
+    with patch("clients.smtp_client.send_alert_notification", mock_smtp), \
+         patch("services.ping_service.PingDiagnosticRepository") as mock_repo_cls:
         mock_repo = mock_repo_cls.return_value
         mock_repo.create.return_value = MagicMock(ping_id=101)
 
@@ -188,6 +181,8 @@ async def test_on_site_unreachable_with_alert_id(mock_session_scope):
         mock_smtp.assert_called_once_with(
             {
                 "site_id": 5,
+                "alert_id": 42,
+                "ping_diagnostic_id": 101,
                 "ping_results": {
                     "packet_count": 10,
                     "packet_loss_percent": "100.00",
@@ -222,6 +217,6 @@ async def test_single_ping_subprocess(mock_exec):
 @patch("asyncio.run")
 def test_process_celery_entrypoint(mock_asyncio_run):
     payload = {"site_id": 1, "sensor_id": 2, "target_ip": "1.1.1.1"}
-    process(payload)
-
-    mock_asyncio_run.assert_called_once()
+    with patch.object(PingIp, "execute", new_callable=AsyncMock):
+        process(payload)
+        mock_asyncio_run.assert_called_once()

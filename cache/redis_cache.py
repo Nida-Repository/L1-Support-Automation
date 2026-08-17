@@ -1,54 +1,40 @@
+"""Redis Caching and Incident State Tracking.
+
+Provides a read-through cache for site and sensor metadata, and a fail-open
+deduplication tracker for incoming PRTG sensor alerts.
+"""
+from __future__ import annotations
+
 import json
 import logging
-import os
 from typing import Any, Optional
-from urllib.parse import urlparse
 
 import redis
-from dotenv import load_dotenv
 
-load_dotenv()
+from config.settings import settings
 
-# 1. Instantiate module-level logger
+from utils.json_utils import json_dumps, json_loads
+
 logger = logging.getLogger(__name__)
 
-REDIS_URL = os.getenv("REDIS_URL")
-
-
-def _safe_url(url: str) -> str:
-    """Scrub passwords from Redis URLs before logging."""
-    try:
-        parsed = urlparse(url)
-        if parsed.password:
-            return url.replace(parsed.password, "******")
-        return url
-    except Exception:
-        return "[masked_redis_url]"
-
-
-if not REDIS_URL:
-    logger.critical("REDIS_URL environment variable is missing!")
-    raise RuntimeError("REDIS_URL environment variable is not set")
-
-logger.info("Initializing Redis connection pool: %s", _safe_url(REDIS_URL))
+logger.info("Initializing Redis connection pool: %s", settings.safe_redis_url)
 
 redis_pool = redis.ConnectionPool.from_url(
-    REDIS_URL,
+    settings.redis_url,
     decode_responses=True,
-    socket_timeout=3,
-    socket_connect_timeout=3,
+    socket_timeout=settings.redis_socket_timeout,
+    socket_connect_timeout=settings.redis_socket_timeout,
     retry_on_timeout=True,
     health_check_interval=30,
-    max_connections=50,
+    max_connections=settings.redis_max_connections,
 )
 redis_client = redis.Redis(connection_pool=redis_pool)
 
 
 class CacheService:
-    """
-    Read-through cache for site mappings. Non-critical path:
-    on any Redis failure we log and degrade gracefully rather than
-    blocking webhook processing.
+    """Read-through cache for site metadata.
+
+    Degrades gracefully on Redis failures rather than blocking the main workflow.
     """
 
     @staticmethod
@@ -65,7 +51,7 @@ class CacheService:
             return None
 
         try:
-            site_info = json.loads(cached_data)
+            site_info = json_loads(cached_data)
             logger.debug("Cache hit for %s", cache_key)
             return site_info
         except (json.JSONDecodeError, TypeError) as exc:
@@ -74,22 +60,26 @@ class CacheService:
 
     @staticmethod
     def set_sensor_site_info(
-        sensor_id: int, site_info: dict[str, Any], ttl_seconds: int = 3600
+        sensor_id: int,
+        site_info: dict[str, Any],
+        ttl_seconds: Optional[int] = None,
     ) -> bool:
+        ttl = ttl_seconds if ttl_seconds is not None else settings.redis_cache_ttl_seconds
         cache_key = f"cache:sensor:{sensor_id}"
         try:
-            redis_client.setex(cache_key, ttl_seconds, json.dumps(site_info))
-            logger.info("Successfully cached site info for sensor_id %s (TTL: %ds)", sensor_id, ttl_seconds)
+            redis_client.setex(cache_key, ttl, json_dumps(site_info))
+            logger.info("Successfully cached site info for sensor_id %s (TTL: %ds)", sensor_id, ttl)
             return True
-        except redis.RedisError as exc:
+        except (redis.RedisError, Exception) as exc:
             logger.warning("Redis SETEX failed for %s: %s", cache_key, exc)
             return False
 
 
 class IncidentStateTracker:
-    """
-    On Redis failure we fail OPEN (treat as not-a-duplicate) so an outage 
-    never silently drops a real alert.
+    """Tracks active sensor states for deduplicating repeated PRTG alert events.
+
+    Fails open (treats alerts as not-a-duplicate on Redis failure) to ensure outages
+    are never silently dropped.
     """
 
     @staticmethod
@@ -104,11 +94,16 @@ class IncidentStateTracker:
             return None
 
     @staticmethod
-    def set_sensor_state(sensor_id: int, status: str, ttl_seconds: int = 86400) -> bool:
+    def set_sensor_state(
+        sensor_id: int,
+        status: str,
+        ttl_seconds: Optional[int] = None,
+    ) -> bool:
+        ttl = ttl_seconds if ttl_seconds is not None else settings.redis_state_ttl_seconds
         cache_key = f"state:sensor:{sensor_id}"
         try:
-            redis_client.setex(cache_key, ttl_seconds, status)
-            logger.info("Updated active state for sensor_id %s -> '%s' (TTL: %ds)", sensor_id, status, ttl_seconds)
+            redis_client.setex(cache_key, ttl, status)
+            logger.info("Updated active state for sensor_id %s -> '%s' (TTL: %ds)", sensor_id, status, ttl)
             return True
         except redis.RedisError as exc:
             logger.warning("Redis SETEX failed for %s: %s", cache_key, exc)
@@ -123,13 +118,17 @@ class IncidentStateTracker:
                 logger.debug("Duplicate detected for sensor_id %s with status '%s'", sensor_id, current_status)
             return is_dup
         except redis.RedisError as exc:
-            logger.warning("Dedup check failed for sensor_id %s (%s) — failing open to allow alert", sensor_id, exc)
-            return False  # fail open — never silently swallow an alert
+            logger.warning(
+                "Dedup check failed for sensor_id %s (%s) — failing open to allow alert",
+                sensor_id,
+                exc,
+            )
+            return False
 
     @staticmethod
     def ping() -> bool:
         try:
-            is_alive = redis_client.ping()
+            is_alive = bool(redis_client.ping())
             logger.debug("Redis ping status: %s", is_alive)
             return is_alive
         except redis.RedisError as exc:
