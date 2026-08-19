@@ -139,6 +139,23 @@ class Settings(BaseModel):
     email_account: Optional[str] = Field(default_factory=lambda: os.getenv("EMAIL_ACCOUNT"))
     email_password: Optional[str] = Field(default_factory=lambda: os.getenv("EMAIL_PASSWORD"))
 
+    # --- MinIO Object Storage Configuration ---
+    minio_endpoint: str = Field(
+        default_factory=lambda: os.getenv("MINIO_ENDPOINT", "localhost:9000")
+    )
+    minio_root_user: Optional[str] = Field(
+        default_factory=lambda: os.getenv("MINIO_ROOT_USER", os.getenv("MINIO_ACCESS_KEY", "miniouser"))
+    )
+    minio_root_password: Optional[str] = Field(
+        default_factory=lambda: os.getenv("MINIO_ROOT_PASSWORD", os.getenv("MINIO_SECRET_KEY", "miniouser123"))
+    )
+    automation_bucket: str = Field(
+        default_factory=lambda: os.getenv("AUTOMATION_BUCKET", "l1-support-attachments")
+    )
+    minio_secure: bool = Field(
+        default_factory=lambda: os.getenv("MINIO_SECURE", "false").strip().lower() in ("true", "1")
+    )
+
     # --- Diagnostic & Ping Service ---
     ping_diag_max_concurrent_jobs: int = Field(
         default_factory=lambda: int(os.getenv("PING_DIAG_MAX_CONCURRENT_JOBS", "5"))
@@ -177,6 +194,10 @@ class Settings(BaseModel):
     @property
     def safe_rabbitmq_url(self) -> str:
         return mask_url_password(self.rabbitmq_url)
+
+    @property
+    def safe_minio_endpoint(self) -> str:
+        return f"{'https' if self.minio_secure else 'http'}://{self.minio_endpoint} [Bucket: {self.automation_bucket}]"
 
 
 @lru_cache(maxsize=1)

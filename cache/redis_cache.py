@@ -134,3 +134,75 @@ class IncidentStateTracker:
         except redis.RedisError as exc:
             logger.warning("Redis ping failed: %s", exc)
             return False
+
+
+class EmailThreadCache:
+    """Redis cache for mapping outgoing and incoming Message-IDs to thread/alert context.
+
+    Provides the first-line lookup for In-Reply-To and References headers to avoid
+    unnecessary PostgreSQL queries on every incoming email.
+    """
+
+    @staticmethod
+    def clean_id(message_id: Optional[str]) -> str:
+        """Strip enclosing angle brackets and whitespace from Message-ID."""
+        if not message_id:
+            return ""
+        return message_id.strip().strip("<>").strip()
+
+    @classmethod
+    def get_thread_by_message_id(cls, message_id: str) -> Optional[dict[str, Any]]:
+        """Lookup alert/thread mapping by Message-ID.
+
+        Returns:
+            dict containing alert_id, thread_id, and escalation_id if cached, else None.
+        """
+        clean_msg_id = cls.clean_id(message_id)
+        if not clean_msg_id:
+            return None
+
+        cache_key = f"msgid:{clean_msg_id}"
+        try:
+            cached_data = redis_client.get(cache_key)
+        except redis.RedisError as exc:
+            logger.warning("Redis GET failed for %s: %s", cache_key, exc)
+            return None
+
+        if not cached_data:
+            logger.debug("Redis cache miss for Message-ID: %s", clean_msg_id)
+            return None
+
+        try:
+            thread_info = json_loads(cached_data)
+            logger.info("Redis cache hit for Message-ID: %s -> %s", clean_msg_id, thread_info)
+            return thread_info
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.error("Corrupt cache value at %s: %s", cache_key, exc)
+            return None
+
+    @classmethod
+    def set_message_id_mapping(
+        cls,
+        message_id: str,
+        data: dict[str, Any],
+        ttl_seconds: Optional[int] = None,
+    ) -> bool:
+        """Store Message-ID mapping in Redis with configurable TTL."""
+        clean_msg_id = cls.clean_id(message_id)
+        if not clean_msg_id or not data:
+            return False
+
+        ttl = ttl_seconds if ttl_seconds is not None else settings.redis_state_ttl_seconds
+        cache_key = f"msgid:{clean_msg_id}"
+        payload = {
+            "alert_id": data.get("alert_id"),
+            "thread_id": data.get("thread_id"),
+            "escalation_id": data.get("escalation_id"),
+        }
+        try:
+            redis_client.setex(cache_key, ttl, json_dumps(payload))
+            logger.info("Cached Message-ID mapping in Redis: %s -> %s (TTL: %ds)", clean_msg_id, payload, ttl)
+            return True
+        except (redis.RedisError, Exception) as exc:
+            logger.warning("Redis SETEX failed for %s: %s", cache_key, exc)
+            return False

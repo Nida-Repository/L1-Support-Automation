@@ -5,6 +5,7 @@ and escalation audit trail persistence in PostgreSQL.
 """
 from __future__ import annotations
 
+import datetime
 import logging
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -22,12 +23,16 @@ from app.crud import (
     DuplicateError,
     EscalationRecordRepository,
     IspContactEmailRepository,
+    IspEmailThreadRepository,
     NotFoundError,
     RepositoryError,
     SiteIspAssignmentRepository,
     session_scope,
 )
 from app.database import SessionLocal
+from app.models import EmailClassificationType, EmailDirectionType
+from cache.redis_cache import EmailThreadCache
+from clients.email_utils import clean_message_id
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -277,15 +282,22 @@ def _handle_escalation(
         return
 
     email_sent = False
+    msg_id: Optional[str] = None
     try:
-        _send_email(
+        msg_id = _send_email(
             to_addresses=[recipient_email],
             cc_addresses=cc_emails,
             subject=subject,
             body_html=body,
         )
         email_sent = True
-        logger.info("Sent %s escalation email for alert_id=%s to %s", escalated_to, alert_id, recipient_email)
+        logger.info(
+            "Sent %s escalation email for alert_id=%s to %s (Message-ID: %s)",
+            escalated_to,
+            alert_id,
+            recipient_email,
+            msg_id,
+        )
     except EmailDispatchError:
         logger.exception(
             "Failed to send %s escalation email for alert_id=%s to %s",
@@ -294,11 +306,15 @@ def _handle_escalation(
             recipient_email,
         )
 
+    clean_id = clean_message_id(msg_id) if msg_id else None
+    thread_id = None
+    escalation_id = None
+
     try:
-        logger.debug("Persisting escalation audit log to database for alert_id=%s...", alert_id)
+        logger.debug("Persisting escalation audit log and email thread to database for alert_id=%s...", alert_id)
         with session_scope(SessionLocal) as session:
             escalation_repo = EscalationRecordRepository(session)
-            escalation_repo.create(
+            escalation_rec = escalation_repo.create(
                 alert_id=alert_id,
                 escalated_to=escalated_to,
                 recipient_email=recipient_email,
@@ -308,6 +324,30 @@ def _handle_escalation(
                 response_received=False,
                 response_notes=None if email_sent else "Email dispatch failed; see worker logs.",
             )
+            escalation_id = getattr(escalation_rec, "escalation_id", None)
+
+            # Store outgoing email thread record
+            if email_sent and clean_id:
+                thread_repo = IspEmailThreadRepository(session)
+                thread_rec = thread_repo.create(
+                    alert_id=alert_id,
+                    message_id=clean_id,
+                    sender=settings.smtp_from_address,
+                    receiver=recipient_email,
+                    cc=cc_emails,
+                    subject=subject,
+                    body=body,
+                    direction=EmailDirectionType.OUTGOING,
+                    classification_type=EmailClassificationType.UNKNOWN,
+                    sent_received_at=datetime.datetime.now(datetime.timezone.utc),
+                )
+                thread_id = getattr(thread_rec, "thread_id", None)
+                logger.info(
+                    "Recorded OUTGOING email thread (thread_id=%s, msg_id=%s) for alert_id=%s",
+                    thread_id,
+                    clean_id,
+                    alert_id,
+                )
 
             alert_repo = AlertHistoryRepository(session)
             alert_repo.update(
@@ -317,10 +357,21 @@ def _handle_escalation(
                 ),
             )
         logger.info("Recorded %s escalation (sent=%s) for alert_id=%s", escalated_to, email_sent, alert_id)
+
+        # Populate Redis cache immediately after successful commit
+        if email_sent and clean_id:
+            EmailThreadCache.set_message_id_mapping(
+                clean_id,
+                {
+                    "alert_id": alert_id,
+                    "thread_id": thread_id,
+                    "escalation_id": escalation_id,
+                },
+            )
     except NotFoundError:
         logger.error("alert_id=%s not found while recording %s escalation", alert_id, escalated_to)
     except DuplicateError as exc:
-        logger.error("Duplicate escalation record for alert_id=%s: %s", alert_id, exc)
+        logger.error("Duplicate escalation or email thread record for alert_id=%s: %s", alert_id, exc)
     except ConstraintViolationError as exc:
         logger.error("Constraint violation recording escalation for alert_id=%s: %s", alert_id, exc)
     except RepositoryError:

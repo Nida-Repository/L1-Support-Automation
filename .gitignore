@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.*
+*.env
 
 # Virtual environments
 venv/
@@ -9,11 +10,25 @@ venv/
 env/
 ENV/
 
+# Python cache & bytecode
 **/__pycache__/
 __pycache__/
+*.py[cod]
+*$py.class
 
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
 
+# Local data & services
+secure_redis/
+secure_minio/minio_data/
+logs/
+*.log
 
-secure_redis
-
-logs
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

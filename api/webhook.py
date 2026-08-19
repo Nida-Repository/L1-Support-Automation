@@ -12,6 +12,7 @@ from typing import Any, Dict
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from kombu.exceptions import OperationalError as KombuOperationalError
 
+from api.email_threads import router as email_threads_router
 from cache.redis_cache import CacheService, IncidentStateTracker
 from config.logging_config import setup_logging
 from config.settings import settings
@@ -21,7 +22,8 @@ from task_queue.tasks import process_prtg_webhook_task
 setup_logging()
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PRTG Webhook Gateway", version="1.0.0")
+app = FastAPI(title="L1 Support Automation Gateway", version="1.0.0")
+app.include_router(email_threads_router)
 
 _WEBHOOK_SECRET = settings.prtg_webhook_secret
 

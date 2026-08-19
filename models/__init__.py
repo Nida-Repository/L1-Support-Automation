@@ -7,6 +7,14 @@ from models.alert_history_model import (
     AlertHistoryUpdate,
     AlertStateRef,
 )
+from models.email_thread_model import (
+    AttachmentRead,
+    CLASSIFICATION_ALIAS_MAP,
+    EmailClassificationUpdate,
+    EmailThreadPage,
+    EmailThreadRead,
+    IncomingEmailPayload,
+)
 from models.escalation_model import (
     EscalatedTo,
     EscalationRecordBase,
@@ -37,6 +45,12 @@ __all__ = [
     "AlertHistoryRead",
     "AlertHistoryUpdate",
     "AlertStateRef",
+    "AttachmentRead",
+    "CLASSIFICATION_ALIAS_MAP",
+    "EmailClassificationUpdate",
+    "EmailThreadPage",
+    "EmailThreadRead",
+    "IncomingEmailPayload",
     "EscalatedTo",
     "EscalationRecordBase",
     "EscalationRecordCreate",

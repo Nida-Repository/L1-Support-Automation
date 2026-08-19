@@ -48,6 +48,16 @@
             "request": "launch",
             "program": "${workspaceFolder}/test/db_check.py",
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Pytest: Run All Tests",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "-v"
+            ],
+            "console": "integratedTerminal"
         }
     ]
 }

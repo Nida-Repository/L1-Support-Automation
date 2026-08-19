@@ -70,8 +70,22 @@ celery_app.conf.update(
                 "x-dead-letter-routing-key": "prtg.webhook.dlq",
             },
         ),
+        Queue(
+            "incoming_email_queue",
+            default_exchange,
+            routing_key="email.incoming",
+            queue_arguments={
+                "x-dead-letter-exchange": "prtg_dlx",
+                "x-dead-letter-routing-key": "prtg.email.dlq",
+            },
+        ),
         Queue("prtg_webhook_dlq", dlx_exchange, routing_key="prtg.webhook.dlq"),
+        Queue("prtg_email_dlq", dlx_exchange, routing_key="prtg.email.dlq"),
     ),
+    task_routes={
+        "process_prtg_webhook": {"queue": "prtg_webhook_queue", "routing_key": "prtg.webhook"},
+        "process_incoming_email": {"queue": "incoming_email_queue", "routing_key": "email.incoming"},
+    },
     task_default_queue="prtg_webhook_queue",
     task_default_exchange="prtg_events",
     task_default_routing_key="prtg.webhook",

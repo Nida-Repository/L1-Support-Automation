@@ -13,7 +13,7 @@ from typing import Any, Callable, Generator, Generic, Iterable, Optional, Sequen
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models import (
     AlertHistory,
@@ -484,12 +484,25 @@ class IspEmailThreadRepository(BaseRepository[IspEmailThread]):
     model = IspEmailThread
 
     def get_by_message_id(self, message_id: str) -> Optional[IspEmailThread]:
-        stmt = select(IspEmailThread).where(IspEmailThread.message_id == message_id)
+        stmt = (
+            select(IspEmailThread)
+            .options(selectinload(IspEmailThread.attachments))
+            .where(IspEmailThread.message_id == message_id)
+        )
+        return self.session.execute(stmt).scalar_one_or_none()
+
+    def get_with_attachments(self, thread_id: int) -> Optional[IspEmailThread]:
+        stmt = (
+            select(IspEmailThread)
+            .options(selectinload(IspEmailThread.attachments))
+            .where(IspEmailThread.thread_id == thread_id)
+        )
         return self.session.execute(stmt).scalar_one_or_none()
 
     def get_reply_chain(self, in_reply_to: str) -> Sequence[IspEmailThread]:
         stmt = (
             select(IspEmailThread)
+            .options(selectinload(IspEmailThread.attachments))
             .where(IspEmailThread.in_reply_to == in_reply_to)
             .order_by(IspEmailThread.sent_received_at.asc())
         )
@@ -504,24 +517,42 @@ class IspEmailThreadRepository(BaseRepository[IspEmailThread]):
         limit: int = DEFAULT_PAGE_SIZE,
         offset: int = 0,
     ) -> Page[IspEmailThread]:
-        stmt = select(IspEmailThread).where(IspEmailThread.alert_id == alert_id)
+        stmt = (
+            select(IspEmailThread)
+            .options(selectinload(IspEmailThread.attachments))
+            .where(IspEmailThread.alert_id == alert_id)
+        )
         if direction is not None:
             stmt = stmt.where(IspEmailThread.direction == direction)
         if classification_type is not None:
             stmt = stmt.where(IspEmailThread.classification_type == classification_type)
 
+        count_stmt = select(IspEmailThread.thread_id).where(IspEmailThread.alert_id == alert_id)
+        if direction is not None:
+            count_stmt = count_stmt.where(IspEmailThread.direction == direction)
+        if classification_type is not None:
+            count_stmt = count_stmt.where(IspEmailThread.classification_type == classification_type)
+
         total = self.session.execute(
-            select(func.count()).select_from(stmt.subquery())
+            select(func.count()).select_from(count_stmt.subquery())
         ).scalar_one()
 
         clamped_limit = _clamp_page_size(limit)
         stmt = (
-            stmt.order_by(IspEmailThread.sent_received_at.desc())
+            stmt.order_by(IspEmailThread.sent_received_at.asc())
             .limit(clamped_limit)
             .offset(offset)
         )
         items = self.session.execute(stmt).scalars().all()
         return Page(items=items, total=total, limit=clamped_limit, offset=offset)
+
+    def update_classification(
+        self,
+        thread_id: int,
+        classification_type: EmailClassificationType,
+    ) -> IspEmailThread:
+        logger.info("Updating email thread classification for thread_id=%d to %s", thread_id, classification_type.value)
+        return self.update(thread_id, classification_type=classification_type)
 
 
 class ReminderHistoryRepository(BaseRepository[ReminderHistory]):

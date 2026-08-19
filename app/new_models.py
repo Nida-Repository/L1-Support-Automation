@@ -1,6 +1,6 @@
 """Backward compatibility bridge for new_models module.
 
-All declarative models and enums are now centrally defined in app.models.
+All declarative models and enums are centrally defined in app.models.
 This module cleanly re-exports them to prevent any breaking changes for legacy imports.
 """
 from __future__ import annotations

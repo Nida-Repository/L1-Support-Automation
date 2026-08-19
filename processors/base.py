@@ -6,6 +6,7 @@ used across all status processor workflows.
 from __future__ import annotations
 
 import json
+from typing import Any, Optional
 from utils.json_utils import json_dumps, json_loads, to_jsonable_python
 
 
