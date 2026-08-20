@@ -1,0 +1,22 @@
+services:
+  redis:
+    image: redis:8.0-alpine
+    container_name: redis
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    ports:
+      - "6379:6379"
+    command: ["sh", "-c", "redis-server /usr/local/etc/redis/redis.conf --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  redis_data:
+    driver: local

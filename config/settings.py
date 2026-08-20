@@ -58,6 +58,26 @@ class Settings(BaseModel):
         extra="ignore",
     )
 
+    # --- JWT & Authentication Security ---
+    jwt_secret_key: Optional[str] = Field(
+        default_factory=lambda: os.getenv("JWT_SECRET_KEY") or os.getenv("JWT_SECRET")
+    )
+    jwt_algorithm: str = Field(default_factory=lambda: os.getenv("JWT_ALGORITHM", "HS256"))
+    jwt_access_token_expire_minutes: int = Field(
+        default_factory=lambda: int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "480"))
+    )
+    admin_username: str = Field(default_factory=lambda: os.getenv("ADMIN_USERNAME", "admin"))
+    admin_password: str = Field(default_factory=lambda: os.getenv("ADMIN_PASSWORD", "ChangeMe@123"))
+
+    # --- Attachment Constraints ---
+    max_attachment_size_bytes: int = Field(
+        default_factory=lambda: int(os.getenv("MAX_ATTACHMENT_SIZE_BYTES", str(25 * 1024 * 1024)))
+    )
+    allowed_attachment_extensions: tuple[str, ...] = (
+        ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".csv", ".docx", ".xlsx",
+        ".pcap", ".log", ".json", ".zip", ".tar.gz", ".msg", ".eml"
+    )
+
     # --- Project & Environment ---
     app_env: str = Field(default_factory=lambda: os.getenv("APP_ENV", "production"))
     debug: bool = Field(
@@ -182,6 +202,28 @@ class Settings(BaseModel):
         if not v or not v.strip():
             raise ValueError("DATABASE_URL must not be empty.")
         return v.strip()
+
+    @field_validator("jwt_secret_key")
+    @classmethod
+    def validate_jwt_secret(cls, v: Optional[str]) -> Optional[str]:
+        app_env = os.getenv("APP_ENV", "production").strip().lower()
+        if not v or not v.strip():
+            if app_env == "test":
+                return "test-jwt-secret-key-for-unit-testing-32chars"
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: 'JWT_SECRET_KEY' environment variable is missing, "
+                "empty, or not set. You must set a strong, non-empty JWT secret key in your environment or .env file."
+            )
+        if len(v.strip()) < 16 and app_env != "test":
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: 'JWT_SECRET_KEY' must be at least 16 characters long "
+                "for secure HS256 token signing."
+            )
+        return v.strip()
+
+    @property
+    def safe_jwt_secret_key(self) -> str:
+        return mask_secret(self.jwt_secret_key)
 
     @property
     def safe_database_url(self) -> str:

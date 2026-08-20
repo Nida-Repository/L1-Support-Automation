@@ -1,34 +1,84 @@
-# Environment variables / Secrets
+# ==============================================================================
+# Git Ignore Rules - L1 Support Automation
+# ==============================================================================
+
+# --- Environment Variables & Secrets ---
 .env
 .env.local
 .env.*
 *.env
+*.pem
+*.key
+*.cert
 
-# Virtual environments
+# --- Virtual Environments ---
 venv/
 .venv/
 env/
 ENV/
+env.bak/
+venv.bak/
 
-# Python cache & bytecode
-**/__pycache__/
+# --- Python Cache & Bytecode ---
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
+*.so
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Testing & Coverage
+# --- Unit Testing, Coverage & Quality Artifacts ---
 .pytest_cache/
 .coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
 htmlcov/
+*.cover
 
-# Local data & services
-secure_redis/
-secure_minio/minio_data/
+# --- Logs, Telemetry & Diagnostics ---
 logs/
 *.log
+*.log.*
+celerybeat-schedule
+celerybeat.pid
 
-# IDE & OS
+# --- Object Storage & Cache Volume Data ---
+secure_redis/data/
+secure_redis/dump.rdb
+secure_minio/minio_data/
+secure_minio/data/
+minio_data/
+attachments_temp/
+
+# --- IDEs & Operating System Artifacts ---
 .vscode/
 .idea/
+*.sublime-project
+*.sublime-workspace
 .DS_Store
+.AppleDouble
+.LSOverride
 Thumbs.db
+ehthumbs.db
+desktop.ini
+*.tmp
+*.temp
+*.swp
+*.swo
+*~

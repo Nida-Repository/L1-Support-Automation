@@ -36,7 +36,28 @@ class UpWorkflow:
             return
 
         logger.info("Processing UpWorkflow for sensor_id: %s", sensor_id)
+        
+        # Extract exact timestamp from webhook if provided (lastup, lastcheck, received_at)
         timestamp = datetime.datetime.now(datetime.timezone.utc)
+        raw_lastup = None
+        if isinstance(payload, dict):
+            raw_lastup = payload.get("last_up") or payload.get("lastup") or payload.get("last_check") or payload.get("lastcheck") or payload.get("received_at")
+        elif hasattr(payload, "last_up") and getattr(payload, "last_up"):
+            raw_lastup = getattr(payload, "last_up")
+        elif hasattr(payload, "received_at") and getattr(payload, "received_at"):
+            raw_lastup = getattr(payload, "received_at")
+
+        if raw_lastup:
+            if isinstance(raw_lastup, datetime.datetime):
+                timestamp = raw_lastup if raw_lastup.tzinfo is not None else raw_lastup.replace(tzinfo=datetime.timezone.utc)
+            elif isinstance(raw_lastup, str) and raw_lastup.strip():
+                try:
+                    from dateutil import parser as dt_parser
+                    parsed_dt = dt_parser.parse(raw_lastup.strip())
+                    timestamp = parsed_dt if parsed_dt.tzinfo is not None else parsed_dt.replace(tzinfo=datetime.timezone.utc)
+                except Exception:
+                    logger.warning("Could not parse webhook timestamp '%s', using UTC now.", raw_lastup)
+
         raw_payload_data = serialize_payload_for_json(payload)
 
         with session_scope(SessionLocal) as session:

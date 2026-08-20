@@ -12,7 +12,13 @@ from typing import Any, Dict
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from kombu.exceptions import OperationalError as KombuOperationalError
 
+from api.alerts import router as alerts_router
+from api.attachments import router as attachments_router
+from api.auth import router as auth_router
+from api.closure import router as closure_router
 from api.email_threads import router as email_threads_router
+from api.notifications import router as notifications_router
+from api.root_cause import router as root_cause_router
 from cache.redis_cache import CacheService, IncidentStateTracker
 from config.logging_config import setup_logging
 from config.settings import settings
@@ -22,8 +28,21 @@ from task_queue.tasks import process_prtg_webhook_task
 setup_logging()
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="L1 Support Automation Gateway", version="1.0.0")
+app = FastAPI(
+    title="L1 Support Automation Gateway",
+    description="Automated L1 Incident Management, Diagnostics, and Root Cause Analysis Gateway",
+    version="1.0.0",
+)
+
+# Public & Authenticated Routers
+app.include_router(auth_router)
+app.include_router(alerts_router)
+app.include_router(root_cause_router)
+app.include_router(attachments_router)
+app.include_router(closure_router)
+app.include_router(notifications_router)
 app.include_router(email_threads_router)
+
 
 _WEBHOOK_SECRET = settings.prtg_webhook_secret
 
