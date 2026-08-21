@@ -7,7 +7,7 @@ from __future__ import annotations
 import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 
 class AttachmentBase(BaseModel):
@@ -43,6 +43,12 @@ class AttachmentRead(AttachmentBase):
     thread_id: Optional[int] = None
     uploaded_by: str = Field(..., description="Authenticated username who uploaded the attachment")
     uploaded_at: datetime.datetime
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def download_url(self) -> str:
+        """Absolute API path to stream this file from MinIO."""
+        return f"/alerts/{self.alert_id}/attachments/{self.attachment_id}/download"
 
 
 class AttachmentPage(BaseModel):

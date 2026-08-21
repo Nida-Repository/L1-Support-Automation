@@ -194,6 +194,50 @@ class MinioService:
             f"Failed to upload attachment '{object_key}' to MinIO after {max_retries} attempts: {last_exception}"
         ) from last_exception
 
+    def get_object_stream(
+        self,
+        *,
+        object_key: str,
+        bucket_name: Optional[str] = None,
+    ) -> tuple[Any, str, int]:
+        """Stream an object from MinIO by its object key.
+
+        Returns:
+            Tuple of (response_stream, content_type, content_length).
+            The caller is responsible for closing the stream after use.
+
+        Raises:
+            MinioServiceError: If the object does not exist or cannot be fetched.
+        """
+        target_bucket = bucket_name or self.bucket_name
+        client = self._get_client()
+        try:
+            response = client.get_object(
+                bucket_name=target_bucket,
+                object_name=object_key,
+            )
+            content_type = response.headers.get("Content-Type", "application/octet-stream")
+            content_length = int(response.headers.get("Content-Length", 0))
+            logger.info(
+                "Opened MinIO stream [Bucket: %s | Key: %s | Size: %d | Type: %s]",
+                target_bucket,
+                object_key,
+                content_length,
+                content_type,
+            )
+            return response, content_type, content_length
+        except S3Error as exc:
+            logger.error(
+                "MinIO S3Error fetching object '%s' from bucket '%s': %s",
+                object_key, target_bucket, exc,
+            )
+            raise MinioServiceError(
+                f"Object '{object_key}' not found or inaccessible in bucket '{target_bucket}': {exc}"
+            ) from exc
+        except Exception as exc:
+            logger.error("Unexpected error fetching MinIO object '%s': %s", object_key, exc)
+            raise MinioServiceError(f"Failed to stream object '{object_key}': {exc}") from exc
+
 
 # Default singleton instance
 minio_service = MinioService()

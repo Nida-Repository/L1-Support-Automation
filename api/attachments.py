@@ -19,6 +19,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.responses import StreamingResponse 
 from sqlalchemy.orm import Session
 
 from api.dependencies import get_current_user
@@ -179,3 +180,90 @@ def list_attachments(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to query attachments from database.",
         )
+
+@router.get(
+    "/{alert_id}/attachments/{attachment_id}/download",
+    summary="Stream and download an attachment file directly from MinIO",
+    response_class=StreamingResponse,
+    responses={
+        200: {"description": "File stream returned successfully"},
+        404: {"description": "Alert or attachment record not found"},
+        502: {"description": "MinIO object storage is unreachable or object missing"},
+    },
+)
+def download_attachment(
+    alert_id: int,
+    attachment_id: int,
+    current_user: UserRead = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """Stream the actual attachment file bytes from MinIO object storage.
+
+    - Validates that the attachment belongs to the given alert.
+    - Streams the file in chunks — memory-efficient even for large files.
+    - Sets Content-Disposition header to trigger browser file download.
+    """
+    logger.info(
+        "User '%s' downloading attachment_id=%d for alert_id=%d",
+        current_user.username,
+        attachment_id,
+        alert_id,
+    )
+
+    att_repo = AttachmentRepository(db)
+
+    # 1. Fetch the attachment record from DB
+    attachment = att_repo.get(attachment_id)
+    if not attachment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Attachment with ID {attachment_id} does not exist.",
+        )
+
+    # 2. Confirm it belongs to the requested alert
+    if attachment.alert_id != alert_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Attachment {attachment_id} does not belong to alert {alert_id}.",
+        )
+
+    # 3. Open a streaming connection to MinIO
+    try:
+        stream, content_type, content_length = minio_service.get_object_stream(
+            object_key=attachment.object_key,
+            bucket_name=attachment.bucket_name,
+        )
+    except MinioServiceError as exc:
+        logger.error(
+            "MinIO stream failed for attachment_id=%d (key=%s): %s",
+            attachment_id,
+            attachment.object_key,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to retrieve file from object storage.",
+        )
+
+    # 4. Build response headers
+    safe_filename = attachment.file_name.replace('"', '_')
+    headers = {
+        "Content-Disposition": f'attachment; filename="{safe_filename}"',
+        "Content-Length": str(content_length) if content_length else "",
+        "Cache-Control": "no-store",
+    }
+
+    # 5. Return chunked streaming response (stream is closed after iteration)
+    def _iter_chunks(response_stream, chunk_size: int = 65536):
+        try:
+            for chunk in response_stream.stream(chunk_size):
+                yield chunk
+        finally:
+            response_stream.close()
+
+    return StreamingResponse(
+        _iter_chunks(stream),
+        media_type=content_type,
+        headers=headers,
+    )    
