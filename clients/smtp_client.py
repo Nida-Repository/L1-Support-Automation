@@ -24,14 +24,17 @@ from app.crud import (
     EscalationRecordRepository,
     IspContactEmailRepository,
     IspEmailThreadRepository,
+    IspRepository,
     NotFoundError,
     RepositoryError,
+    SensorRepository,
     SiteIspAssignmentRepository,
+    SiteRepository,
     session_scope,
 )
 from app.database import SessionLocal
 from app.models import EmailClassificationType, EmailDirectionType
-from cache.redis_cache import EmailThreadCache
+from cache.redis_cache import EmailThreadCache, IspReplyMonitor
 from clients.email_utils import clean_message_id
 from config.settings import settings
 
@@ -171,6 +174,98 @@ def _send_email(
         raise EmailDispatchError("network error contacting SMTP server") from exc
 
 
+def _send_threaded_email(
+    *,
+    to_addresses: List[str],
+    cc_addresses: Optional[List[str]],
+    subject: str,
+    body_html: str,
+    in_reply_to: str,
+    references: Optional[List[str]] = None,
+) -> str:
+    """Send an email as a reply within an existing RFC 5322 thread.
+
+    Sets In-Reply-To and References headers for proper email client threading.
+    Returns the newly generated Message-ID (angle-bracket-free).
+    """
+    if not to_addresses:
+        logger.error("Threaded email dispatch attempted without target recipients (To: is empty)")
+        raise EmailDispatchError("no recipient addresses provided")
+
+    domain = settings.smtp_from_address.split("@")[-1] if "@" in settings.smtp_from_address else None
+    msg_id = make_msgid(domain=domain)
+
+    msg = MIMEMultipart("alternative")
+    msg["Message-ID"] = msg_id
+    msg["Subject"] = subject
+    msg["From"] = settings.smtp_from_address
+    msg["To"] = ", ".join(to_addresses)
+    if cc_addresses:
+        msg["Cc"] = ", ".join(cc_addresses)
+
+    clean_irt = clean_message_id(in_reply_to)
+    if clean_irt:
+        msg["In-Reply-To"] = f"<{clean_irt}>"
+
+    # RFC 5322 References: accumulate unique past references + direct parent
+    ref_list: list[str] = []
+    if references:
+        for r in references:
+            c = clean_message_id(r)
+            if c and c not in ref_list:
+                ref_list.append(c)
+    if clean_irt and clean_irt not in ref_list:
+        ref_list.append(clean_irt)
+
+    if ref_list:
+        msg["References"] = " ".join(f"<{r}>" for r in ref_list)
+
+    msg.attach(MIMEText(body_html, "html", "utf-8"))
+
+    all_recipients = list(to_addresses) + list(cc_addresses or [])
+
+    logger.info(
+        "Attempting Threaded SMTP dispatch [Host: %s:%d] | Message-ID: %s | In-Reply-To: %s | To: %s | CC: %s | Subject: %r",
+        settings.smtp_host,
+        settings.smtp_port,
+        msg_id,
+        clean_irt,
+        to_addresses,
+        cc_addresses or [],
+        subject,
+    )
+
+    try:
+        smtp_cls = smtplib.SMTP_SSL if settings.smtp_use_ssl else smtplib.SMTP
+        with smtp_cls(settings.smtp_host, settings.smtp_port, timeout=settings.smtp_timeout_seconds) as server:
+            server.ehlo()
+            if settings.smtp_use_tls and not settings.smtp_use_ssl:
+                server.starttls()
+                server.ehlo()
+            if settings.smtp_username and settings.smtp_password:
+                server.login(settings.smtp_username, settings.smtp_password)
+
+            server.sendmail(settings.smtp_from_address, all_recipients, msg.as_string())
+            logger.info("Threaded email successfully sent via SMTP to %d recipient(s)", len(all_recipients))
+            return clean_message_id(msg_id)
+
+    except smtplib.SMTPAuthenticationError as exc:
+        logger.error("SMTP authentication failed against %s:%s -> %s", settings.smtp_host, settings.smtp_port, exc)
+        raise EmailDispatchError("SMTP authentication failed") from exc
+    except smtplib.SMTPRecipientsRefused as exc:
+        logger.error("SMTP server refused recipients %s: %s", all_recipients, exc)
+        raise EmailDispatchError("recipients refused by SMTP server") from exc
+    except smtplib.SMTPConnectError as exc:
+        logger.error("Could not connect to SMTP server %s:%s -> %s", settings.smtp_host, settings.smtp_port, exc)
+        raise EmailDispatchError("could not connect to SMTP server") from exc
+    except smtplib.SMTPException as exc:
+        logger.error("SMTP error while sending threaded mail: %s", exc)
+        raise EmailDispatchError("SMTP error") from exc
+    except (TimeoutError, OSError) as exc:
+        logger.error("Network error contacting SMTP host %s:%s -> %s", settings.smtp_host, settings.smtp_port, exc)
+        raise EmailDispatchError("network error contacting SMTP server") from exc
+
+
 # --------------------------------------------------------------------------- #
 # Public Dispatch Functions
 # --------------------------------------------------------------------------- #
@@ -182,6 +277,7 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
     """
     site_id = payload.get("site_id")
     alert_id = payload.get("alert_id")
+    sensor_id = payload.get("sensor_id")
     ping_diagnostic_id = payload.get("ping_diagnostic_id")
     ping_results = payload.get("ping_results") or {}
 
@@ -197,16 +293,43 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
         )
         return
 
+    site_name = "Unknown Site"
+    isp_name = "Unknown ISP"
+    sensor_name = f"Sensor #{sensor_id}" if sensor_id else "Network Sensor"
+    isp_email_id: Optional[int] = None
+
     try:
         with session_scope(SessionLocal) as session:
             logger.debug("Fetching primary ISP assignment for site_id=%s", site_id)
             assignment_repo = SiteIspAssignmentRepository(session)
+            site_repo = SiteRepository(session)
+            isp_repo = IspRepository(session)
+            sensor_repo = SensorRepository(session)
+            alert_repo = AlertHistoryRepository(session)
+
             assignment = assignment_repo.get_primary_for_site(site_id)
             if assignment is None:
                 logger.error("No primary ISP assignment found for site_id=%s", site_id)
                 return
             circuit_id = assignment.circuit_id
             isp_id = assignment.isp_id
+
+            site_obj = site_repo.get(site_id)
+            if site_obj:
+                site_name = site_obj.site_name
+
+            isp_obj = isp_repo.get(isp_id)
+            if isp_obj:
+                isp_name = isp_obj.isp_name
+
+            if sensor_id:
+                sensor_obj = sensor_repo.get(sensor_id)
+                if sensor_obj:
+                    sensor_name = sensor_obj.sensor_name
+            else:
+                alert_obj = alert_repo.get(alert_id)
+                if alert_obj and alert_obj.sensor:
+                    sensor_name = alert_obj.sensor.sensor_name
 
             logger.debug("Fetching active contact emails for isp_id=%s", isp_id)
             contact_repo = IspContactEmailRepository(session)
@@ -221,13 +344,20 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
         logger.exception("Unexpected error looking up ISP details for site_id=%s", site_id)
         return
 
-    isp_recipient = _validated(isp_contacts[0].email_address) if isp_contacts else None
+    isp_recipient = None
+    if isp_contacts:
+        isp_recipient = _validated(isp_contacts[0].email_address)
+        isp_email_id = isp_contacts[0].email_id
+
     support_recipient = _validated(settings.support_team_email)
     if not support_recipient:
         logger.warning("SUPPORT_TEAM_EMAIL is not configured (or invalid) in the environment.")
 
     template_context = {
         "site_id": site_id,
+        "site_name": site_name,
+        "isp_name": isp_name,
+        "sensor_name": sensor_name,
         "alert_id": alert_id,
         "circuit_id": circuit_id,
         "ping_diagnostic_id": ping_diagnostic_id,
@@ -255,6 +385,11 @@ def send_alert_notification(payload: Dict[str, Any]) -> None:
         body_template="isp_alert_body.html",
         context=template_context,
         alert_id=alert_id,
+        isp_email_id=isp_email_id,
+        sensor_name=sensor_name,
+        site_name=site_name,
+        isp_name=isp_name,
+        circuit_id=circuit_id,
     )
 
 
@@ -267,8 +402,13 @@ def _handle_escalation(
     body_template: str,
     context: Dict[str, Any],
     alert_id: int,
+    isp_email_id: Optional[int] = None,
+    sensor_name: str = "",
+    site_name: str = "",
+    isp_name: str = "",
+    circuit_id: str = "",
 ) -> None:
-    """Render and send escalation email, then record the audit trail in the DB."""
+    """Render and send escalation email, record audit trail in DB, and register for reply monitoring."""
     logger.debug("Executing escalation handler for alert_id=%s to target '%s'", alert_id, escalated_to)
     try:
         subject = _render_template(subject_template, context).strip()
@@ -368,6 +508,25 @@ def _handle_escalation(
                     "escalation_id": escalation_id,
                 },
             )
+
+            # Register for automated reply monitoring if escalated to ISP
+            if escalated_to.upper() == "ISP" and escalation_id:
+                IspReplyMonitor.register_monitor(
+                    alert_id=alert_id,
+                    escalation_id=escalation_id,
+                    message_id=clean_id,
+                    isp_email=recipient_email,
+                    isp_email_id=isp_email_id,
+                    sensor_name=sensor_name or context.get("sensor_name", ""),
+                    site_name=site_name or context.get("site_name", ""),
+                    isp_name=isp_name or context.get("isp_name", ""),
+                    circuit_id=circuit_id or context.get("circuit_id", ""),
+                    original_subject=subject,
+                    original_references=[],
+                    to_addresses=[recipient_email],
+                    cc_addresses=cc_emails or [],
+                )
+                logger.info("Registered ISP reply monitor for alert_id=%s [Message-ID: %s]", alert_id, clean_id)
     except NotFoundError:
         logger.error("alert_id=%s not found while recording %s escalation", alert_id, escalated_to)
     except DuplicateError as exc:

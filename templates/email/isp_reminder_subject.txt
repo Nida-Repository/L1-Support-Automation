@@ -1,0 +1,1 @@
+[REMINDER #{{ reminder_number }}] Ticket ID {{alert_id}} - Network Outage Alert - Circuit {{ circuit_id }}

@@ -329,6 +329,18 @@ def process_incoming_email_task(self, raw_payload: Dict[str, Any]) -> Dict[str, 
                 },
             )
 
+        # Notify ISP Reply Monitor service to cancel pending reminder timers in Redis immediately
+        try:
+            from services.isp_monitor_service import IspReplyMonitorService
+            IspReplyMonitorService.handle_reply_received(
+                alert_id=payload.alert_id,
+                message_id=clean_id,
+                in_reply_to=clean_in_reply_to,
+                references=payload.references,
+            )
+        except Exception as mon_exc:
+            logger.warning("Error notifying IspReplyMonitorService of reply: %s", mon_exc)
+
         logger.info(
             "Successfully processed inbound email [Message-ID: %s | Alert: %d | Thread: %s | Attachments: %d]",
             clean_id,
@@ -360,3 +372,24 @@ def process_incoming_email_task(self, raw_payload: Dict[str, Any]) -> Dict[str, 
             logger.critical("Max retries exceeded for inbound email %s. Routing to DLQ...", msg_id)
             _send_email_to_dlq(raw_payload, f"max_retries_exceeded: {exc}")
             return {"status": "failed", "reason": "max_retries_exceeded", "message_id": msg_id}
+
+
+@celery_app.task(
+    bind=True,
+    name="scan_isp_reply_monitors",
+    max_retries=3,
+    default_retry_delay=30,
+    ignore_result=True,
+)
+def scan_isp_reply_monitors_task(self) -> None:
+    """Celery Beat periodic task: Scans active ISP reply monitors in Redis and dispatches reminders when due."""
+    logger.debug("Celery Beat triggered scan_isp_reply_monitors task")
+    try:
+        from services.isp_monitor_service import IspReplyMonitorService
+        IspReplyMonitorService.run_scan()
+    except Exception as exc:
+        logger.error("Error executing scan_isp_reply_monitors task: %s", exc, exc_info=True)
+        try:
+            raise self.retry(exc=exc)
+        except self.MaxRetriesExceededError:
+            logger.critical("Max retries exceeded for scan_isp_reply_monitors task: %s", exc)

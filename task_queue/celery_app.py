@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from celery import Celery
 from celery.signals import after_setup_logger, worker_init
+from celery.schedules import crontab
 from kombu import Exchange, Queue
 
 from config.logging_config import LOGGING_CONFIG, setup_logging
@@ -79,16 +80,35 @@ celery_app.conf.update(
                 "x-dead-letter-routing-key": "prtg.email.dlq",
             },
         ),
+        Queue(
+            "isp_monitor_queue",
+            default_exchange,
+            routing_key="isp.monitor",
+            queue_arguments={
+                "x-dead-letter-exchange": "prtg_dlx",
+                "x-dead-letter-routing-key": "prtg.monitor.dlq",
+            },
+        ),
         Queue("prtg_webhook_dlq", dlx_exchange, routing_key="prtg.webhook.dlq"),
         Queue("prtg_email_dlq", dlx_exchange, routing_key="prtg.email.dlq"),
+        Queue("prtg_monitor_dlq", dlx_exchange, routing_key="prtg.monitor.dlq"),
     ),
     task_routes={
         "process_prtg_webhook": {"queue": "prtg_webhook_queue", "routing_key": "prtg.webhook"},
         "process_incoming_email": {"queue": "incoming_email_queue", "routing_key": "email.incoming"},
+        "scan_isp_reply_monitors": {"queue": "isp_monitor_queue", "routing_key": "isp.monitor"},
     },
     task_default_queue="prtg_webhook_queue",
     task_default_exchange="prtg_events",
     task_default_routing_key="prtg.webhook",
+    # --- Celery Beat Periodic Tasks ---
+    beat_schedule={
+        "scan-isp-reply-monitors": {
+            "task": "scan_isp_reply_monitors",
+            "schedule": crontab(minute=f"*/{settings.isp_monitor_beat_interval_minutes}"),
+            "options": {"queue": "isp_monitor_queue"},
+        },
+    },
 )
 
 logger.info("Celery queues and exchanges configured successfully.")
@@ -99,11 +119,12 @@ logger.info("Celery queues and exchanges configured successfully.")
 # ---------------------------------------------------------------------------
 
 @after_setup_logger.connect
-def setup_celery_logging(logger, format, loglevel, plaintext, **kwargs):
+def setup_celery_logging(logger=None, format=None, loglevel=None, plaintext=None, **kwargs):
     """Re-apply logging configuration after Celery's own logger setup runs."""
     import logging.config
     logging.config.dictConfig(LOGGING_CONFIG)
-    logger.info("Custom dictConfig successfully applied to Celery loggers.")
+    if logger:
+        logger.info("Custom dictConfig successfully applied to Celery loggers.")
 
 
 @worker_init.connect

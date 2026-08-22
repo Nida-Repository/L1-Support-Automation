@@ -5,6 +5,7 @@ deduplication tracker for incoming PRTG sensor alerts.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 from typing import Any, Optional
@@ -206,3 +207,309 @@ class EmailThreadCache:
         except (redis.RedisError, Exception) as exc:
             logger.warning("Redis SETEX failed for %s: %s", cache_key, exc)
             return False
+
+
+class IspReplyMonitor:
+    """Manages temporary event-driven monitoring state for ISP email replies in Redis.
+
+    Keeps minimal in-memory state in Redis to avoid hitting PostgreSQL on every Celery Beat tick.
+    When incoming replies arrive, response_received is set immediately in Redis, allowing
+    Celery Beat to inspect Redis state first without querying the database for all monitors.
+    """
+
+    PREFIX = "isp:monitor:"
+    ALERT_INDEX_PREFIX = "isp:monitor:alert:"
+    INDEX_KEY = "isp:monitor:index"
+    LOCK_KEY = "isp:monitor:lock:scan"
+
+    @classmethod
+    def clean_id(cls, message_id: Optional[str]) -> str:
+        """Strip enclosing angle brackets and whitespace from Message-ID."""
+        if not message_id:
+            return ""
+        return message_id.strip().strip("<>").strip()
+
+    @classmethod
+    def register_monitor(
+        cls,
+        *,
+        alert_id: int,
+        escalation_id: int,
+        message_id: str,
+        isp_email: str,
+        isp_email_id: Optional[int],
+        sensor_name: str,
+        site_name: str,
+        isp_name: str,
+        circuit_id: str,
+        original_subject: str,
+        original_references: Optional[list[str]] = None,
+        to_addresses: Optional[list[str]] = None,
+        cc_addresses: Optional[list[str]] = None,
+        timeout_minutes: Optional[int] = None,
+    ) -> bool:
+        """Register an outbound ISP email for automated reply monitoring."""
+        clean_msg_id = cls.clean_id(message_id)
+        if not clean_msg_id:
+            logger.error("Cannot register ISP monitor with empty Message-ID")
+            return False
+
+        timeout = timeout_minutes or settings.isp_reply_timeout_minutes
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        next_reminder = now_utc + datetime.timedelta(minutes=timeout)
+
+        monitor_data = {
+            "alert_id": alert_id,
+            "escalation_id": escalation_id,
+            "message_id": clean_msg_id,
+            "isp_email": isp_email,
+            "isp_email_id": isp_email_id,
+            "sensor_name": sensor_name,
+            "site_name": site_name,
+            "isp_name": isp_name,
+            "circuit_id": circuit_id,
+            "original_subject": original_subject,
+            "original_references": original_references or [],
+            "to_addresses": to_addresses or [isp_email],
+            "cc_addresses": cc_addresses or [],
+            "reminder_count": 0,
+            "response_received": False,
+            "monitoring_active": True,
+            "sent_at": now_utc.isoformat(),
+            "next_reminder_time": next_reminder.isoformat(),
+            "last_reminder_sent_at": None,
+        }
+
+        key = f"{cls.PREFIX}{clean_msg_id}"
+        alert_key = f"{cls.ALERT_INDEX_PREFIX}{alert_id}"
+        ttl = settings.isp_monitor_redis_ttl_seconds
+
+        try:
+            pipe = redis_client.pipeline()
+            pipe.setex(key, ttl, json_dumps(monitor_data))
+            pipe.setex(alert_key, ttl, clean_msg_id)
+            pipe.sadd(cls.INDEX_KEY, clean_msg_id)
+            pipe.execute()
+            logger.info(
+                "Registered ISP reply monitor [Alert: %s | MsgID: %s | NextReminder: %s]",
+                alert_id,
+                clean_msg_id,
+                next_reminder.isoformat(),
+            )
+            return True
+        except (redis.RedisError, Exception) as exc:
+            logger.error("Failed to register ISP reply monitor for MsgID %s: %s", clean_msg_id, exc)
+            return False
+
+    @classmethod
+    def get_monitor(cls, message_id: str) -> Optional[dict[str, Any]]:
+        """Retrieve monitor state for a given Message-ID."""
+        clean_msg_id = cls.clean_id(message_id)
+        if not clean_msg_id:
+            return None
+        key = f"{cls.PREFIX}{clean_msg_id}"
+        try:
+            data = redis_client.get(key)
+            if data:
+                return json_loads(data)
+        except Exception as exc:
+            logger.warning("Redis GET failed for %s: %s", key, exc)
+        return None
+
+    @classmethod
+    def get_monitor_by_alert_id(cls, alert_id: int) -> Optional[dict[str, Any]]:
+        """Retrieve monitor state by alert_id."""
+        alert_key = f"{cls.ALERT_INDEX_PREFIX}{alert_id}"
+        try:
+            clean_msg_id = redis_client.get(alert_key)
+            if clean_msg_id:
+                return cls.get_monitor(clean_msg_id)
+        except Exception as exc:
+            logger.warning("Redis GET failed for %s: %s", alert_key, exc)
+        return None
+
+    @classmethod
+    def mark_response_received(
+        cls,
+        *,
+        message_id: Optional[str] = None,
+        in_reply_to: Optional[str] = None,
+        references: Optional[list[str]] = None,
+        alert_id: Optional[int] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Mark monitor as response_received=True and stop active monitoring in Redis.
+
+        Matches against candidate Message-IDs (direct message_id, in_reply_to, references)
+        or alert_id to find and cancel the active monitor immediately upon reply ingestion.
+        """
+        candidates: list[str] = []
+        if in_reply_to:
+            clean_irt = cls.clean_id(in_reply_to)
+            if clean_irt:
+                candidates.append(clean_irt)
+        if references:
+            for ref in references:
+                clean_ref = cls.clean_id(ref)
+                if clean_ref and clean_ref not in candidates:
+                    candidates.append(clean_ref)
+        if message_id:
+            clean_m = cls.clean_id(message_id)
+            if clean_m and clean_m not in candidates:
+                candidates.append(clean_m)
+
+        target_msg_id: Optional[str] = None
+        monitor_state: Optional[dict[str, Any]] = None
+
+        # 1. Search candidate message IDs
+        for cid in candidates:
+            m = cls.get_monitor(cid)
+            if m:
+                target_msg_id = cid
+                monitor_state = m
+                break
+
+        # 2. Fallback to alert_id lookup
+        if not monitor_state and alert_id:
+            alert_key = f"{cls.ALERT_INDEX_PREFIX}{alert_id}"
+            try:
+                msg_id_from_alert = redis_client.get(alert_key)
+                if msg_id_from_alert:
+                    m = cls.get_monitor(msg_id_from_alert)
+                    if m:
+                        target_msg_id = msg_id_from_alert
+                        monitor_state = m
+            except Exception as exc:
+                logger.warning("Error fetching alert key %s: %s", alert_key, exc)
+
+        if not target_msg_id or not monitor_state:
+            logger.debug("No active ISP reply monitor matched candidate IDs %s / alert_id %s", candidates, alert_id)
+            return None
+
+        # Update Redis state
+        monitor_state["response_received"] = True
+        monitor_state["monitoring_active"] = False
+        monitor_state["response_received_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        root_msg_id = monitor_state.get("message_id") or target_msg_id
+        key = f"{cls.PREFIX}{root_msg_id}"
+        ttl = settings.isp_monitor_redis_ttl_seconds
+        try:
+            pipe = redis_client.pipeline()
+            pipe.setex(key, ttl, json_dumps(monitor_state))
+            pipe.srem(cls.INDEX_KEY, root_msg_id)
+            if alert_id:
+                pipe.delete(f"{cls.ALERT_INDEX_PREFIX}{alert_id}")
+            pipe.execute()
+            logger.info(
+                "Marked ISP monitor response_received=True in Redis [MsgID: %s | Alert: %s]",
+                root_msg_id,
+                monitor_state.get("alert_id"),
+            )
+            return monitor_state
+        except Exception as exc:
+            logger.error("Failed to update response_received for monitor %s: %s", target_msg_id, exc)
+            return monitor_state
+
+    @classmethod
+    def update_monitor(cls, message_id: str, updates: dict[str, Any]) -> bool:
+        """Update fields in an existing monitor state, preserving TTL."""
+        clean_msg_id = cls.clean_id(message_id)
+        if not clean_msg_id:
+            return False
+        key = f"{cls.PREFIX}{clean_msg_id}"
+        try:
+            current = cls.get_monitor(clean_msg_id)
+            if not current:
+                return False
+            current.update(updates)
+            ttl = redis_client.ttl(key)
+            if ttl is None or ttl <= 0:
+                ttl = settings.isp_monitor_redis_ttl_seconds
+            redis_client.setex(key, ttl, json_dumps(current))
+            return True
+        except Exception as exc:
+            logger.error("Failed to update monitor %s: %s", clean_msg_id, exc)
+            return False
+
+    @classmethod
+    def stop_monitoring(cls, message_id: str, alert_id: Optional[int] = None) -> None:
+        """Stop monitoring for a given Message-ID and remove from active index."""
+        clean_msg_id = cls.clean_id(message_id)
+        if not clean_msg_id:
+            return
+        key = f"{cls.PREFIX}{clean_msg_id}"
+        try:
+            current = cls.get_monitor(clean_msg_id)
+            if current:
+                current["monitoring_active"] = False
+                ttl = redis_client.ttl(key)
+                if ttl is None or ttl <= 0:
+                    ttl = settings.isp_monitor_redis_ttl_seconds
+                redis_client.setex(key, ttl, json_dumps(current))
+            redis_client.srem(cls.INDEX_KEY, clean_msg_id)
+            if alert_id:
+                redis_client.delete(f"{cls.ALERT_INDEX_PREFIX}{alert_id}")
+            logger.info("Stopped monitoring for Message-ID: %s", clean_msg_id)
+        except Exception as exc:
+            logger.warning("Error stopping monitor for %s: %s", clean_msg_id, exc)
+
+    @classmethod
+    def get_all_active_monitors(cls) -> list[dict[str, Any]]:
+        """Retrieve all currently active monitor states from Redis in a single batch."""
+        active_monitors: list[dict[str, Any]] = []
+        try:
+            members = redis_client.smembers(cls.INDEX_KEY)
+            if not members:
+                return []
+
+            pipe = redis_client.pipeline()
+            member_list = list(members)
+            for msg_id in member_list:
+                pipe.get(f"{cls.PREFIX}{msg_id}")
+            results = pipe.execute()
+
+            stale_members: list[str] = []
+            for msg_id, raw_data in zip(member_list, results):
+                if not raw_data:
+                    stale_members.append(msg_id)
+                    continue
+                try:
+                    state = json_loads(raw_data)
+                    if state.get("monitoring_active", False) and not state.get("response_received", False):
+                        active_monitors.append(state)
+                    else:
+                        stale_members.append(msg_id)
+                except Exception:
+                    stale_members.append(msg_id)
+
+            if stale_members:
+                redis_client.srem(cls.INDEX_KEY, *stale_members)
+
+            return active_monitors
+        except Exception as exc:
+            logger.error("Failed to retrieve active monitors from Redis: %s", exc)
+            return []
+
+    @classmethod
+    def acquire_scan_lock(cls) -> bool:
+        """Acquire distributed lock to prevent overlapping Celery Beat executions."""
+        try:
+            return bool(
+                redis_client.set(
+                    cls.LOCK_KEY,
+                    "locked",
+                    nx=True,
+                    ex=settings.isp_monitor_lock_ttl_seconds,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Failed to acquire scan lock: %s", exc)
+            return False
+
+    @classmethod
+    def release_scan_lock(cls) -> None:
+        """Release the distributed scan lock."""
+        try:
+            redis_client.delete(cls.LOCK_KEY)
+        except Exception as exc:
+            logger.warning("Failed to release scan lock: %s", exc)

@@ -196,6 +196,23 @@ class Settings(BaseModel):
         default_factory=lambda: float(os.getenv("PAUSE_BETWEEN_BATCHES_SECONDS", "1.0"))
     )
 
+    # --- ISP Reply Monitoring & Automated Reminders ---
+    isp_reply_timeout_minutes: int = Field(
+        default_factory=lambda: int(os.getenv("ISP_REPLY_TIMEOUT_MINUTES", "90"))
+    )
+    isp_max_reminders: int = Field(
+        default_factory=lambda: int(os.getenv("ISP_MAX_REMINDERS", "5"))
+    )
+    isp_monitor_beat_interval_minutes: int = Field(
+        default_factory=lambda: int(os.getenv("CELERY_BEAT_INTERVAL_MINUTES", "5"))
+    )
+    isp_monitor_redis_ttl_seconds: int = Field(
+        default_factory=lambda: int(os.getenv("ISP_MONITOR_REDIS_TTL_SECONDS", "604800"))
+    )
+    isp_monitor_lock_ttl_seconds: int = Field(
+        default_factory=lambda: int(os.getenv("ISP_MONITOR_LOCK_TTL_SECONDS", "60"))
+    )
+
     @field_validator("database_url")
     @classmethod
     def validate_database_url(cls, v: str) -> str:

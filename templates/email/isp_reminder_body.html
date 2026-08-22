@@ -1,0 +1,43 @@
+<html>
+  <body style="font-family: Arial, sans-serif; font-size: 14px; color: #222222;">
+    <p>Dear ISP Support Team,</p>
+
+    <p>
+      This is <strong>Reminder #{{ reminder_number }}</strong> regarding the previously reported network incident.
+      We have not yet received your response. Kindly provide an update on the issue at your earliest convenience to assist us in continuing our investigation.
+    </p>
+
+    <table cellpadding="6" cellspacing="0" style="border-collapse: collapse; border: 1px solid #dddddd;">
+      <tr style="background-color: #f5f5f5;">
+        <td style="border: 1px solid #dddddd;"><strong>Ticket / Alert ID</strong></td>
+        <td style="border: 1px solid #dddddd;">{{ alert_id }}</td>
+      </tr>
+      <tr>
+        <td style="border: 1px solid #dddddd;"><strong>Circuit ID</strong></td>
+        <td style="border: 1px solid #dddddd;">{{ circuit_id }}</td>
+      </tr>
+      <tr style="background-color: #f5f5f5;">
+        <td style="border: 1px solid #dddddd;"><strong>Sensor</strong></td>
+        <td style="border: 1px solid #dddddd;">{{ sensor_name }}</td>
+      </tr>
+      <tr>
+        <td style="border: 1px solid #dddddd;"><strong>Site</strong></td>
+        <td style="border: 1px solid #dddddd;">{{ site_name }}</td>
+      </tr>
+      <tr style="background-color: #f5f5f5;">
+        <td style="border: 1px solid #dddddd;"><strong>ISP Name</strong></td>
+        <td style="border: 1px solid #dddddd;">{{ isp_name }}</td>
+      </tr>
+      <tr>
+        <td style="border: 1px solid #dddddd;"><strong>Reminder Sent At</strong></td>
+        <td style="border: 1px solid #dddddd;">{{ reminder_sent_at }}</td>
+      </tr>
+    </table>
+
+    <p>
+      Please investigate circuit <strong>{{ circuit_id }}</strong> and provide an update on the current restoration status or ETA.
+    </p>
+
+    <p>Thank you,<br />Support Team</p>
+  </body>
+</html>
