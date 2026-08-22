@@ -137,11 +137,13 @@ def process_new_email(client: IMAPClient, uid: int) -> None:
 
         alert_id = matched_context["alert_id"]
         thread_id = matched_context.get("thread_id")
+        escalation_id = matched_context.get("escalation_id")
 
         # Construct lightweight task payload for Celery / RabbitMQ
         task_payload = {
             "alert_id": alert_id,
             "thread_id": thread_id,
+            "escalation_id": escalation_id,
             "message_id": msg_id,
             "in_reply_to": in_reply_to,
             "references": references,

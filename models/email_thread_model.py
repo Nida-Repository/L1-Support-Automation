@@ -121,6 +121,7 @@ class IncomingEmailPayload(BaseModel):
 
     alert_id: int
     thread_id: Optional[int] = None
+    escalation_id: Optional[int] = None
     message_id: str
     in_reply_to: Optional[str] = None
     references: List[str] = Field(default_factory=list)

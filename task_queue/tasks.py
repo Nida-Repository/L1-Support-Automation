@@ -15,6 +15,7 @@ from kombu import Producer
 from pydantic import ValidationError
 
 from app.crud import AttachmentRepository, IspEmailThreadRepository, session_scope
+from app.crud import EscalationRecordRepository, NotFoundError
 from app.database import SessionLocal
 from app.models import EmailClassificationType, EmailDirectionType
 from cache.redis_cache import EmailThreadCache, IncidentStateTracker
@@ -247,6 +248,33 @@ def process_incoming_email_task(self, raw_payload: Dict[str, Any]) -> Dict[str, 
                     payload.alert_id,
                     clean_id,
                 )
+
+            # Mark escalation response received if escalation_id is known
+            if payload.escalation_id:
+                try:
+                    escalation_repo = EscalationRecordRepository(session)
+                    escalation_repo.mark_response_received(
+                        payload.escalation_id,
+                        notes=f"ISP replied via email (Message-ID: {clean_id})",
+                    )
+                    logger.info(
+                        "Marked response_received=True for escalation_id=%d [Alert: %d | Message-ID: %s]",
+                        payload.escalation_id,
+                        payload.alert_id,
+                        clean_id,
+                    )
+                except NotFoundError:
+                    logger.warning(
+                        "escalation_id=%d not found while marking response received [Alert: %d]",
+                        payload.escalation_id,
+                        payload.alert_id,
+                    )
+                except Exception as esc_exc:
+                    logger.error(
+                        "Failed to mark response received for escalation_id=%d: %s",
+                        payload.escalation_id,
+                        esc_exc,
+                    )
 
             # Process attachments
             for att_meta in payload.attachment_metadata:
